@@ -10,10 +10,10 @@
 # [ Load Dependencies ]
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/flux.utils"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
 . "$SCRIPT_DIR/flux.core"
-# Ensure script is called via action.sh/internal mechanism
-assert_internal_execution
+
 # Set log component name for logging function
 export LOG_COMPONENT="Manager"
 
@@ -68,73 +68,6 @@ check_resource_integrity() {
     done
     
     log_info "Resource check passed"
-    return 0
-}
-
-
-# ==============================================================================
-# [ Proxy Mode Detection & Feature Validation ]
-# ==============================================================================
-
-# Exported variable for tproxy.sh to use
-export USE_TPROXY=0
-
-# Determine which proxy mode to use based on kernel support and config
-detect_proxy_mode() {
-    USE_TPROXY=0
-    
-    case "$PROXY_MODE" in
-        0)  # Auto-detect
-            if check_tproxy_support; then
-                USE_TPROXY=1
-                log_info "Mode: TPROXY (auto)"
-            else
-                log_warn "TPROXY unsupported, using REDIRECT"
-            fi
-            ;;
-        1)  # Force TPROXY
-            if check_tproxy_support; then
-                USE_TPROXY=1
-                log_info "Mode: TPROXY (forced)"
-            else
-                log_error "TPROXY forced but unsupported"
-                return 1
-            fi
-            ;;
-        2)  # Force REDIRECT
-            log_info "Mode: REDIRECT (forced)"
-            ;;
-    esac
-    
-    export USE_TPROXY
-    return 0
-}
-
-# Validate CN IP bypass requirements
-validate_cn_bypass() {
-    if [ "$BYPASS_CN_IP" -eq 1 ]; then
-        if ! check_ipset_support; then
-            log_warn "ipset unsupported, CN bypass disabled"
-            export BYPASS_CN_IP=0
-        else
-            log_debug "ipset support confirmed"
-        fi
-    fi
-}
-
-# Pre-start validation: mode detection + feature checks
-pre_start_validation() {
-    log_info "Pre-start validation..."
-    
-    # Detect and validate proxy mode
-    if ! detect_proxy_mode; then
-        return 1
-    fi
-    
-    # Validate CN bypass if enabled
-    validate_cn_bypass
-    
-    log_info "Validation passed"
     return 0
 }
 
@@ -246,8 +179,6 @@ start_service_sequence() {
     init_environment || return 1
     check_resource_integrity || return 1
     
-    # Pre-start: mode detection + feature validation
-    pre_start_validation || return 1
     
     # Clean any stale state
     force_cleanup

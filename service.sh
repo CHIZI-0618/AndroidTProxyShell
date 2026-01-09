@@ -6,13 +6,10 @@
 # ==============================================================================
 
 # Load system configuration
-. "/data/adb/Flux/scripts/flux.utils" || {
-    echo "ERROR: Cannot load utils"
-    exit 1
-}
+. "/data/adb/Flux/scripts/flux.config"
+. "/data/adb/Flux/scripts/flux.logger"
 
 export LOG_COMPONENT="Service"
-export TPROXY_INTERNAL_TOKEN="valid_entry_2026"
 
 # ==============================================================================
 # BOOT DETECTION UTILITY

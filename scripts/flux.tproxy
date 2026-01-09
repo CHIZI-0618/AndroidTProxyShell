@@ -2,15 +2,144 @@
 
 
 # ==============================================================================
-# TProxy Firewall Rules Manager (flux.tproxy)
-# Description: Manages iptables/ip6tables rules for transparent proxy
-# Note: USE_TPROXY is exported by start.sh after pre_start_validation()
+# SCRIPT SETUP & ENVIRONMENT
 # ==============================================================================
 
-. "$(dirname "$(readlink -f "$0")")/flux.utils"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
 
-assert_internal_execution
+# Set log component for logging utility
 export LOG_COMPONENT="Tproxy"
+
+# ==============================================================================
+# KERNEL & SYSTEM FEATURE DETECTION
+# ==============================================================================
+
+# Check if a specific kernel configuration is enabled in /proc/config.gz
+check_kernel_feature() {
+    if [ "$SKIP_CHECK_FEATURE" = "1" ]; then
+        log Debug "Kernel feature check skipped"
+        return 0
+    fi
+    
+    local feature="$1"
+    local config_name="CONFIG_${feature}"
+
+    if [ -f /proc/config.gz ]; then
+        if zcat /proc/config.gz 2> /dev/null | grep -qE "^${config_name}=[ym]$"; then
+            log_debug "Kernel feature $feature is enabled"
+            return 0
+        else
+            log_debug "Kernel feature $feature is disabled or not found"
+            return 1
+        fi
+    else
+        log_debug "Cannot check kernel feature $feature: /proc/config.gz not available"
+        return 1
+    fi
+}
+
+# Verify TPROXY support by checking the kernel module/config
+check_tproxy_support() {
+    if check_kernel_feature "NETFILTER_XT_TARGET_TPROXY"; then
+        log_debug "Kernel TPROXY support confirmed"
+        return 0
+    else
+        log_debug "Kernel TPROXY support not available"
+        return 1
+    fi
+}
+
+
+# ==============================================================================
+# COMMAND WRAPPERS
+# ==============================================================================
+
+# Generic wrapper for iptables/ip6tables with wait lock
+run_ipt_command() {
+    local cmd="$1"
+    shift
+    local args="$*"
+    command $cmd -w 100 $args
+}
+
+iptables()    { run_ipt_command iptables "$@"; }
+ip6tables()   { run_ipt_command ip6tables "$@"; }
+ip_rule()     { command ip rule "$@"; }
+ip6_rule()    { command ip -6 rule "$@"; }
+ip_route()    { command ip route "$@"; }
+ip6_route()   { command ip -6 route "$@"; }
+
+# ==============================================================================
+# UID & PACKAGE RESOLUTION
+# ==============================================================================
+
+# Retrieve UID for a package name from Android system package list
+get_package_uid() {
+    local pkg="$1"
+    local line
+    local uid
+    if [ ! -r /data/system/packages.list ]; then
+        log_debug "Cannot read /data/system/packages.list"
+        return 1
+    fi
+    line=$(grep -m1 "^${pkg}[[:space:]]" /data/system/packages.list 2> /dev/null || true)
+    if [ -z "$line" ]; then
+        log_debug "Package not found in packages.list: $pkg"
+        return 1
+    fi
+
+    uid=$(echo "$line" | awk '{print $2}' 2> /dev/null || true)
+    case "$uid" in
+        '' | *[!0-9]*)
+            uid=$(echo "$line" | awk '{print $(NF-1)}' 2> /dev/null || true)
+            ;;
+    esac
+    case "$uid" in
+        '' | *[!0-9]*)
+            log_debug "Invalid UID format for package: $pkg"
+            return 1
+            ;;
+        *)
+            echo "$uid"
+            return 0
+            ;;
+    esac
+}
+
+# Resolve multiple packages/tokens (with optional user prefix user:pkg) to UIDs
+find_packages_uid() {
+    local out
+    local token
+    local uid_base
+    local final_uid
+    # shellcheck disable=SC2048
+    for token in $*; do
+        local user_prefix=0
+        local package="$token"
+        case "$token" in
+            *:*)
+                user_prefix=$(echo "$token" | cut -d: -f1)
+                package=$(echo "$token" | cut -d: -f2-)
+                case "$user_prefix" in
+                    '' | *[!0-9]*)
+                        log_warn "Invalid user prefix in token: $token, using 0"
+                        user_prefix=0
+                        ;;
+                esac
+                ;;
+        esac
+        if uid_base=$(get_package_uid "$package" 2> /dev/null); then
+            final_uid=$((user_prefix * 100000 + uid_base))
+            out="$out $final_uid"
+            log_debug "Resolved package $token to UID $final_uid" >&2
+        else
+            log_warn "Failed to resolve UID for package: $package" >&2
+        fi
+    done
+    echo "$out" | awk '{$1=$1;print}'
+}
 
 # ==============================================================================
 # IPTABLES CHAIN MANAGEMENT
@@ -45,14 +174,18 @@ safe_chain_create() {
         cmd="ip6tables"
     fi
 
+    if [ "$DRY_RUN" -eq 1 ] || ! safe_chain_exists "$family" "$table" "$chain"; then
+        $cmd -t "$table" -N "$chain"
+    fi
+
     $cmd -t "$table" -F "$chain"
 }
 
 # ==============================================================================
 # IPSET & GEO-IP MANAGEMENT
 # ==============================================================================
-# Note: CN IP list download is handled by update.sh
-# This script only handles ipset setup from pre-downloaded files
+
+# Download China IP lists if bypass is enabled and file is outdated
 
 # Initialize ipset with downloaded CIDR rules
 setup_cn_ipset() {
@@ -647,20 +780,50 @@ cleanup_ipset() {
     log_info "ipset 'cnip' and 'cnip6' destroyed"
 }
 
-# USE_TPROXY is expected to be exported by start.sh before calling this script
-# Default to 0 (REDIRECT mode) if not set
-: "${USE_TPROXY:=0}"
+# ==============================================================================
+# MAIN EXECUTION FLOW
+# ==============================================================================
+
+# Determine which proxy mode to use based on kernel support and config
+detect_proxy_mode() {
+    USE_TPROXY=0
+    case "$PROXY_MODE" in
+        0)
+            if check_tproxy_support; then
+                USE_TPROXY=1
+                log_info "Kernel supports TPROXY, using TPROXY mode (auto)"
+            else
+                log_warn "Kernel does not support TPROXY, falling back to REDIRECT mode (auto)"
+            fi
+            ;;
+        1)
+            if check_tproxy_support; then
+                USE_TPROXY=1
+                log_info "Using TPROXY mode (forced by configuration)"
+            else
+                log_error "TPROXY mode forced but kernel does not support TPROXY"
+                exit 1
+            fi
+            ;;
+        2)
+            log_info "Using REDIRECT mode (forced by configuration)"
+            ;;
+    esac
+}
 
 start_proxy() {
-    log_info "Applying firewall rules..."
-    
-    # CN IP bypass - setup ipset from pre-downloaded files
-    # Note: download is handled by update.sh
+    log_info "Starting proxy setup..."
     if [ "$BYPASS_CN_IP" -eq 1 ]; then
-        setup_cn_ipset || {
-            log_warn "ipset setup failed, CN bypass disabled"
+        if ! check_kernel_feature "IP_SET" || ! check_kernel_feature "NETFILTER_XT_SET"; then
+            log_error "Kernel does not support ipset (CONFIG_IP_SET, CONFIG_NETFILTER_XT_SET). Cannot bypass CN IPs"
             BYPASS_CN_IP=0
-        }
+        else
+            download_cn_ip_list || log_warn "Failed to download CN IP list, continuing without it"
+            if ! setup_cn_ipset; then
+                log_error "Failed to setup ipset, CN bypass disabled"
+                BYPASS_CN_IP=0
+            fi
+        fi
     fi
 
     if [ "$USE_TPROXY" -eq 1 ]; then
@@ -679,12 +842,11 @@ start_proxy() {
     
     block_loopback_traffic enable
     
-    log_info "Firewall rules applied"
+    log_info "Proxy setup completed"
 }
 
 stop_proxy() {
-    log_info "Removing firewall rules..."
-    
+    log_info "Stopping proxy..."
     if [ "$USE_TPROXY" -eq 1 ]; then
         cleanup_tproxy_chain4
         cleanup_routing4
@@ -693,6 +855,7 @@ stop_proxy() {
             cleanup_routing6
         fi
     else
+        log_info "Cleaning up REDIRECT chains"
         cleanup_redirect_chain4
         if [ "$PROXY_IPV6" -eq 1 ]; then
             cleanup_redirect_chain6
@@ -702,23 +865,25 @@ stop_proxy() {
     cleanup_ipset
     block_loopback_traffic disable
     
-    log_info "Firewall rules removed"
+    log_info "Proxy stopped"
 }
 
 block_loopback_traffic() {
     case "$1" in
         enable)
-            ip6tables -t filter -A OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null || true
-            iptables -t filter -A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null || true
+            ip6tables -t filter -A OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
+            iptables -t filter -A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
             ;;
         disable)
-            ip6tables -t filter -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null || true
-            iptables -t filter -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null || true
+            ip6tables -t filter -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
+            iptables -t filter -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
             ;;
     esac
 }
 
 main() {
+    detect_proxy_mode
+    
     local action="${1:-}"
     
     case "$action" in

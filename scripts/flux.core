@@ -26,6 +26,17 @@ validate_singbox_config() {
     return 0
 }
 
+is_core_running() {
+    local pid_file="$PID_FILE"
+    local pid
+    
+    pid=$(cat "$pid_file" 2>/dev/null) || return 1
+    [ -z "$pid" ] && return 1
+    echo "$pid" | grep -Eq '^[0-9]+$' || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    netstat -tunlp 2>/dev/null | grep -q ":${PROXY_TCP_PORT}.*LISTEN"
+}
+
 # Start sing-box core process and verify PID
 start_core() {
     log_debug "Starting sing-box..."

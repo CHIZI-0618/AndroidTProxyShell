@@ -7,14 +7,11 @@
 # ==============================================================================
 
 # Load system configuration
-. "/data/adb/Flux/scripts/flux.utils" || {
-    echo "ERROR: Cannot load utils"
-    exit 1
-}
+. "/data/adb/Flux/scripts/flux.config"
+. "/data/adb/Flux/scripts/flux.logger"
 
 export INTERACTIVE=1
 export LOG_COMPONENT="Action"
-export TPROXY_INTERNAL_TOKEN="valid_entry_2026"
 
 
 # ==============================================================================
@@ -76,6 +73,17 @@ check_and_update() {
     else
         log_debug "Update skipped (within interval)"
     fi
+}
+
+is_core_running() {
+    local pid_file="$PID_FILE"
+    local pid
+    
+    pid=$(cat "$pid_file" 2>/dev/null) || return 1
+    [ -z "$pid" ] && return 1
+    echo "$pid" | grep -Eq '^[0-9]+$' || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    netstat -tunlp 2>/dev/null | grep -q ":${PROXY_TCP_PORT}.*LISTEN"
 }
 
 

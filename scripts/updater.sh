@@ -10,7 +10,9 @@
 # [ Load Dependencies ]
 # ------------------------------------------------------------------------------
 
-. "$(dirname "$(readlink -f "$0")")/flux.utils"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
 
 export INTERACTIVE=1
 # Set log component name
@@ -387,6 +389,8 @@ main() {
     
     # Download CN IP list if enabled in config
     download_cn_ip_list
+    
+    date +%s > "$LAST_UPDATE_FILE"
     
     # Cleanup
     cleanup_temp_files
