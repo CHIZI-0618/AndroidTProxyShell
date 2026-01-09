@@ -1,0 +1,93 @@
+#!/system/bin/sh
+
+
+# ==============================================================================
+# Flux Core Management (flux.core)
+# Description: Manages sing-box core process lifecycle (start/stop/restart)
+# ==============================================================================
+
+
+# Validate sing-box JSON configuration syntax
+validate_singbox_config() {
+    log_debug "Validating config..."
+    
+    local check_output check_result
+    
+    check_output=$("$SING_BOX_BIN" check -c "$CONFIG_FILE" -D "$RUN_DIR" 2>&1)
+    check_result=$?
+    
+    if [ $check_result -ne 0 ]; then
+        log_error "Config invalid"
+        log_debug "Details: $check_output"
+        return 1
+    fi
+    
+    log_info "Config validated"
+    return 0
+}
+
+# Start sing-box core process and verify PID
+start_core() {
+    log_debug "Starting sing-box..."
+    
+    nohup "$SING_BOX_BIN" run \
+        -c "$CONFIG_FILE" \
+        -D "$RUN_DIR" \
+        >/dev/null 2>&1 &
+    
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+    
+    local start_wait_count=0
+    while [ $start_wait_count -lt "$CORE_TIMEOUT" ]; do
+        
+        if is_core_running; then
+            log_info "Core started (PID: $pid)"
+            return 0
+        fi
+        
+        sleep 0.5
+        start_wait_count=$((start_wait_count + 1))
+    done
+    
+    log_error "Core start failed"
+    stop_core
+    return 1
+}
+
+# Stop sing-box core process gracefully (SIGTERM -> SIGKILL)
+stop_core() {
+    if [ -s "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        
+        if kill -0 "$pid" 2>/dev/null; then
+            log_debug "Stopping PID $pid"
+            kill "$pid" 2>/dev/null
+            
+            local stop_wait_count=0
+            while kill -0 "$pid" 2>/dev/null && [ $stop_wait_count -lt "$CORE_TIMEOUT" ]; do
+                sleep 0.5
+                stop_wait_count=$((stop_wait_count + 1))
+            done
+            
+            if kill -0 "$pid" 2>/dev/null; then
+                log_debug "Force killing $pid"
+                kill -9 "$pid" 2>/dev/null
+                sleep 0.5
+            fi
+        fi
+    else
+        pkill -9 -f "sing-box.*run.*$CONFIG_FILE" 2>/dev/null
+    fi
+    
+    rm -f "$PID_FILE"
+    log_info "Core stopped"
+}
+
+# Restart core (stop then start)
+restart_core() {
+    stop_core
+    sleep 1
+    start_core
+}

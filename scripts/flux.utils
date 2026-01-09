@@ -1,0 +1,174 @@
+#!/system/bin/sh
+
+
+# ==============================================================================
+# Flux Utilities Library (flux.utils)
+# Description: Core utilities, kernel checks, and shared functions
+# ==============================================================================
+
+# Load modular components
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
+
+
+# ==============================================================================
+# [ Core Process Utilities ]
+# ==============================================================================
+
+# Check if core is running
+is_core_running() {
+    local pid_file="$PID_FILE"
+    local pid
+    
+    pid=$(cat "$pid_file" 2>/dev/null) || return 1
+    [ -z "$pid" ] && return 1
+    echo "$pid" | grep -Eq '^[0-9]+$' || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    netstat -tunlp 2>/dev/null | grep -q ":${PROXY_TCP_PORT}.*LISTEN"
+}
+
+# Get core PID
+get_core_pid() {
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    echo "$pid" | grep -Eq '^[0-9]+$' || return 1
+    echo "$pid"
+}
+
+
+# ==============================================================================
+# [ Security Guard ]
+# ==============================================================================
+
+assert_internal_execution() {
+    if [ "${TPROXY_INTERNAL_TOKEN:-}" = "valid_entry_2026" ]; then
+        return 0
+    fi
+    echo "Please use 'action.sh' to manage the service."
+    exit 1
+}
+
+
+# ==============================================================================
+# [ Kernel Feature Detection ]
+# ==============================================================================
+
+# Check if a specific kernel configuration is enabled in /proc/config.gz
+check_kernel_feature() {
+    local feature="$1"
+    local config_name="CONFIG_${feature}"
+
+    if [ -f /proc/config.gz ]; then
+        if zcat /proc/config.gz 2> /dev/null | grep -qE "^${config_name}=[ym]$"; then
+            log_debug "Kernel: $feature enabled"
+            return 0
+        else
+            log_debug "Kernel: $feature disabled"
+            return 1
+        fi
+    else
+        log_debug "Kernel: /proc/config.gz unavailable"
+        return 1
+    fi
+}
+
+# Verify TPROXY support by checking the kernel module/config
+check_tproxy_support() {
+    check_kernel_feature "NETFILTER_XT_TARGET_TPROXY"
+}
+
+# Check ipset support
+check_ipset_support() {
+    check_kernel_feature "IP_SET" && check_kernel_feature "NETFILTER_XT_SET"
+}
+
+
+# ==============================================================================
+# [ UID & Package Resolution ]
+# ==============================================================================
+
+# Retrieve UID for a package name from Android system package list
+get_package_uid() {
+    local pkg="$1"
+    local line
+    local uid
+    if [ ! -r /data/system/packages.list ]; then
+        log_debug "Cannot read packages.list"
+        return 1
+    fi
+    line=$(grep -m1 "^${pkg}[[:space:]]" /data/system/packages.list 2> /dev/null || true)
+    if [ -z "$line" ]; then
+        log_debug "Package not found: $pkg"
+        return 1
+    fi
+
+    uid=$(echo "$line" | awk '{print $2}' 2> /dev/null || true)
+    case "$uid" in
+        '' | *[!0-9]*)
+            uid=$(echo "$line" | awk '{print $(NF-1)}' 2> /dev/null || true)
+            ;;
+    esac
+    case "$uid" in
+        '' | *[!0-9]*)
+            log_debug "Invalid UID for: $pkg"
+            return 1
+            ;;
+        *)
+            echo "$uid"
+            return 0
+            ;;
+    esac
+}
+
+# Resolve multiple packages/tokens (with optional user prefix user:pkg) to UIDs
+find_packages_uid() {
+    local out
+    local token
+    local uid_base
+    local final_uid
+    for token in $*; do
+        local user_prefix=0
+        local package="$token"
+        case "$token" in
+            *:*)
+                user_prefix=$(echo "$token" | cut -d: -f1)
+                package=$(echo "$token" | cut -d: -f2-)
+                case "$user_prefix" in
+                    '' | *[!0-9]*)
+                        log_debug "Invalid user prefix: $token"
+                        user_prefix=0
+                        ;;
+                esac
+                ;;
+        esac
+        if uid_base=$(get_package_uid "$package" 2> /dev/null); then
+            final_uid=$((user_prefix * 100000 + uid_base))
+            out="$out $final_uid"
+            log_debug "Resolved $token -> UID $final_uid"
+        else
+            log_debug "Failed to resolve: $package"
+        fi
+    done
+    echo "$out" | awk '{$1=$1;print}'
+}
+
+
+# ==============================================================================
+# [ Network Command Wrappers ]
+# ==============================================================================
+
+# Generic wrapper for iptables/ip6tables with wait lock
+run_ipt_command() {
+    local cmd="$1"
+    shift
+    local args="$*"
+    command $cmd -w 100 $args
+}
+
+iptables()    { run_ipt_command iptables "$@"; }
+ip6tables()   { run_ipt_command ip6tables "$@"; }
+ip_rule()     { command ip rule "$@"; }
+ip6_rule()    { command ip -6 rule "$@"; }
+ip_route()    { command ip route "$@"; }
+ip6_route()   { command ip -6 route "$@"; }

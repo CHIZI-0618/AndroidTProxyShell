@@ -1,0 +1,182 @@
+#!/system/bin/sh
+
+
+# ==============================================================================
+# [ Log System & Status Property Management ]
+# ==============================================================================
+#
+# Log Level Guidelines:
+# ┌─────────┬────────────────────────────────────────────────────────────────┐
+# │ Level   │ Usage                                                          │
+# ├─────────┼────────────────────────────────────────────────────────────────┤
+# │ DEBUG   │ Internal state, variable values, flow tracing                  │
+# │         │ Examples: "Resolved UID 10086", "Kernel feature X enabled"     │
+# ├─────────┼────────────────────────────────────────────────────────────────┤
+# │ INFO    │ Normal operations, milestones, successful completions          │
+# │         │ Examples: "Service started", "Config validated", "TProxy ready"│
+# ├─────────┼────────────────────────────────────────────────────────────────┤
+# │ WARN    │ Recoverable issues, fallback behavior, non-fatal problems      │
+# │         │ Service continues but something is suboptimal                  │
+# │         │ Examples: "Update timeout, using cached config"                │
+# │         │ Auto-updates prop to WARNING state (if no ERROR)               │
+# ├─────────┼────────────────────────────────────────────────────────────────┤
+# │ ERROR   │ Fatal issues that prevent normal operation                     │
+# │         │ Service cannot continue or critical feature unavailable        │
+# │         │ Examples: "Core failed to start", "Config validation failed"   │
+# │         │ Auto-updates prop to ERROR state                               │
+# └─────────┴────────────────────────────────────────────────────────────────┘
+
+
+# ==============================================================================
+# [ Status Property Management ]
+# ==============================================================================
+
+# Priority Convention: Error(3) > Warning(2) > Running/Stopped(1)
+PROP_LEVEL=0
+PROP_TEXT=""
+PROP_DETAIL=""
+
+prop_run()   { set_prop "run"   "$1"; }
+prop_stop()  { set_prop "stop"  "$1"; }
+prop_warn()  { set_prop "warn"  "$1"; }
+prop_error() { set_prop "error" "$1"; }
+
+# Set Status (With Priority Check)
+set_prop() {
+    local status="$1"
+    local detail="${2:-}"
+    local current_level=1
+    
+    case "$status" in
+        error)   current_level=3 ;;
+        warn)    current_level=2 ;;
+        *)       current_level=1 ;;
+    esac
+
+    if [ "$current_level" -ge "$PROP_LEVEL" ]; then
+        PROP_LEVEL="$current_level"
+        PROP_TEXT="$status"
+        PROP_DETAIL="$detail"
+    fi
+}
+
+# Commit Status to File (Call only once at the end of the script)
+update_description() {
+    # Return immediately if no status has been set
+    [ "$PROP_LEVEL" -eq 0 ] && return 0
+
+    local pid_info=""
+    local desc_text=""
+    
+    if [ "$PROP_TEXT" = "run" ] && [ -s "$PID_FILE" ]; then
+        pid_info="PID: $(cat "$PID_FILE")"
+    fi
+
+    case "$PROP_TEXT" in
+        run)
+            desc_text="🥰 [RUNNING] ${pid_info}"
+            ;;
+        warn)
+            desc_text="🤔 [WARNING] ${PROP_DETAIL:-Degraded}"
+            ;;
+        error)
+            desc_text="🤯 [ERROR] ${PROP_DETAIL:-Failed}"
+            ;;
+        stop)
+            desc_text="😴 [STOPPED]"
+            ;;
+        *)
+            desc_text="😇 [UNKNOWN]"
+            ;;
+    esac
+    
+    if grep -q "\\\\n" "$PROP_FILE"; then
+        sed -i "s|\\\\n.*|\\\\n${desc_text}|" "$PROP_FILE"
+    else
+        sed -i "s|^description=.*|&\\\\n${desc_text}|" "$PROP_FILE"
+    fi
+}
+
+
+# ==============================================================================
+# [ Advanced Logging System ]
+# ==============================================================================
+
+# Log levels mapping
+readonly LOG_LEVEL_DEBUG=0
+readonly LOG_LEVEL_INFO=1
+readonly LOG_LEVEL_WARN=2
+readonly LOG_LEVEL_ERROR=3
+
+# Debug: Internal tracing, variable values, detailed flow info
+log_debug() { log "Debug" "$1"; }
+
+# Info: Normal operations, milestones, successful steps
+log_info()  { log "Info"  "$1"; }
+
+# Warn: Recoverable issues, fallback behavior (auto-updates prop)
+log_warn() {
+    log "Warn" "$1"
+    # Auto-set prop to warn (only if not already error)
+    prop_warn "$1"
+}
+
+# Error: Fatal issues, operation cannot continue (auto-updates prop)
+log_error() {
+    log "Error" "$1"
+    # Auto-set prop to error (highest priority)
+    prop_error "$1"
+}
+
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    local level_score=0
+    local current_log_level="${LOG_LEVEL:-1}"
+    local component="${LOG_COMPONENT:-System}"
+
+    case "$level" in
+        Debug) level_score=0 ;;
+        Info)  level_score=1 ;;
+        Warn)  level_score=2 ;;
+        Error) level_score=3 ;;
+        *)     level_score=1 ;;
+    esac
+
+    [ "$level_score" -lt "$current_log_level" ] && return 0
+
+    timestamp="$(date +"%Y-%m-%d %H:%M:%S")"
+    
+    if [ "${LOG_ENABLE:-1}" -eq 1 ] && [ -n "$LOG_FILE" ]; then
+        if [ ! -d "$RUN_DIR" ]; then
+             mkdir -p "$RUN_DIR" 2>/dev/null
+        fi
+        printf "%s [%s] [%s]: %s\n" "$timestamp" "$component" "$level" "$message" >> "$LOG_FILE" 2>/dev/null
+    fi
+    
+    if [ -t 1 ] || [ "${INTERACTIVE:-0}" -eq 1 ]; then
+        printf "[%s]: %s\n" "$timestamp" "$message"
+    fi
+}
+
+
+# ==============================================================================
+# [ Log Rotation ]
+# ==============================================================================
+
+rotate_log() {
+    [ ! -f "$LOG_FILE" ] && return 0
+    
+    local size
+    size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    
+    if [ "$size" -gt "$LOG_MAX_SIZE" ]; then
+        [ -f "${LOG_FILE}.2" ] && mv -f "${LOG_FILE}.2" "${LOG_FILE}.3" 2>/dev/null
+        [ -f "${LOG_FILE}.1" ] && mv -f "${LOG_FILE}.1" "${LOG_FILE}.2" 2>/dev/null
+        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
+        
+        # Clean old logs (>7 days)
+        find "$RUN_DIR" -name "Flux.log.*" -mtime +7 -delete 2>/dev/null || true
+    fi
+}

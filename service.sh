@@ -6,7 +6,7 @@
 # ==============================================================================
 
 # Load system configuration
-. "/data/adb/Flux/scripts/utils.sh" || {
+. "/data/adb/Flux/scripts/flux.utils" || {
     echo "ERROR: Cannot load utils"
     exit 1
 }

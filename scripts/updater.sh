@@ -2,7 +2,7 @@
 
 
 # ==============================================================================
-# TProxyShell Subscription Updater (update.sh)
+# TProxyShell Subscription Updater (updater.sh)
 # Description: Downloads, converts, and generates sing-box configuration
 # ==============================================================================
 
@@ -10,7 +10,7 @@
 # [ Load Dependencies ]
 # ------------------------------------------------------------------------------
 
-. "$(dirname "$(readlink -f "$0")")/utils.sh"
+. "$(dirname "$(readlink -f "$0")")/flux.utils"
 
 export INTERACTIVE=1
 # Set log component name
@@ -106,6 +106,57 @@ readonly JQ_SCRIPT_MERGE_CONFIG='
 
 
 # ==============================================================================
+# [ CN IP List Management ]
+# ==============================================================================
+
+# Download China IP lists if bypass is enabled and file is outdated
+download_cn_ip_list() {
+    if [ "$BYPASS_CN_IP" -ne 1 ]; then
+        log_debug "CN IP bypass disabled, skipping download"
+        return 0
+    fi
+
+    log_info "Updating CN IP list..."
+
+    # Download IPv4 list
+    if [ ! -f "$CN_IP_FILE" ] || [ "$(find "$CN_IP_FILE" -mtime +7 2> /dev/null)" ]; then
+        log_info "Fetching CN IPv4 list..."
+        if curl -fsSL --connect-timeout 10 --retry 3 \
+            "$CN_IP_URL" \
+            -o "$CN_IP_FILE.tmp" 2>/dev/null; then
+            mv "$CN_IP_FILE.tmp" "$CN_IP_FILE"
+            log_info "CN IPv4 list updated"
+        else
+            log_warn "CN IPv4 download failed"
+            rm -f "$CN_IP_FILE.tmp"
+        fi
+    else
+        log_debug "CN IPv4 list is up to date"
+    fi
+
+    # Download IPv6 list if enabled
+    if [ "$PROXY_IPV6" -eq 1 ]; then
+        if [ ! -f "$CN_IPV6_FILE" ] || [ "$(find "$CN_IPV6_FILE" -mtime +7 2> /dev/null)" ]; then
+            log_info "Fetching CN IPv6 list..."
+            if curl -fsSL --connect-timeout 10 --retry 3 \
+                "$CN_IPV6_URL" \
+                -o "$CN_IPV6_FILE.tmp" 2>/dev/null; then
+                mv "$CN_IPV6_FILE.tmp" "$CN_IPV6_FILE"
+                log_info "CN IPv6 list updated"
+            else
+                log_warn "CN IPv6 download failed"
+                rm -f "$CN_IPV6_FILE.tmp"
+            fi
+        else
+            log_debug "CN IPv6 list is up to date"
+        fi
+    fi
+    
+    return 0
+}
+
+
+# ==============================================================================
 # [ Cleanup & Utilities ]
 # ==============================================================================
 
@@ -171,6 +222,10 @@ validate_file() {
 # Convert subscription content to sing-box format using subconverter
 download_and_convert_subscription() {
     log_info "Download and converting subscription to sing-box format..."
+    
+    if [ -z "$SUBSCRIPTION_URL" ]; then
+        fatal "SUBSCRIPTION_URL is not set. Please configure it in settings.ini"
+    fi
     
     # Create configuration file for subconverter
     cat > "$GENERATE_FILE" <<EOF
@@ -330,10 +385,13 @@ main() {
     merge_nodes_into_template
     validate_and_report
     
+    # Download CN IP list if enabled in config
+    download_cn_ip_list
+    
     # Cleanup
     cleanup_temp_files
     
-    log_info "Update successfully"
+    log_info "Update completed"
     exit 0
 }
 
