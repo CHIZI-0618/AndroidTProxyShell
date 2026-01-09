@@ -2,8 +2,16 @@
 
 
 # ==============================================================================
-# ENVIRONMENT SETUP
+# Flux Boot Service (service.sh)
+# Description: Android boot initialization - launches inotify daemons and 
+#              conditionally starts services if module is enabled
+# Entry Points: This + flux.mod.inotify are the ONLY service entry points
 # ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# [ Environment Setup ]
+# ------------------------------------------------------------------------------
 
 # Load system configuration
 . "/data/adb/Flux/scripts/flux.config"
@@ -11,8 +19,9 @@
 
 export LOG_COMPONENT="Service"
 
+
 # ==============================================================================
-# BOOT DETECTION UTILITY
+# [ Boot Detection ]
 # ==============================================================================
 
 # Wait for the Android system to signal boot completion via getprop
@@ -35,19 +44,93 @@ wait_for_boot() {
     return 1
 }
 
+
 # ==============================================================================
-# MAIN EXECUTION FLOW
+# [ Inotify Daemon Launcher ]
+# ==============================================================================
+
+# Launch inotifyd watcher for module toggle (disable file)
+start_inotify_module() {
+    local handler="$SCRIPTS_DIR/flux.mod.inotify"
+    local watch_dir="$MAGISK_MOD_DIR"
+    
+    # Ensure handler is executable
+    [ -f "$handler" ] && chmod +x "$handler" 2>/dev/null
+    
+    # Kill any existing instance
+    pkill -f "inotifyd.*flux.mod.inotify" 2>/dev/null || true
+    
+    # Start inotifyd watching for create(n) and delete(d) events
+    # Specifically monitors file create/delete in the module directory
+    inotifyd "$handler" "$watch_dir:nd" &
+    
+    log_info "Module toggle watcher started (monitoring $watch_dir)"
+}
+
+# Launch inotifyd watcher for network changes
+# Called AFTER services are fully started
+start_inotify_net() {
+    local handler="$SCRIPTS_DIR/flux.net.inotify"
+    local watch_dir="/data/misc/net"
+    
+    # Ensure handler is executable
+    [ -f "$handler" ] && chmod +x "$handler" 2>/dev/null
+    
+    # Only start if the watch directory exists
+    if [ -d "$watch_dir" ]; then
+        # Kill any existing instance
+        pkill -f "inotifyd.*flux.net.inotify" 2>/dev/null || true
+        
+        # Start inotifyd watching for write(w) events
+        inotifyd "$handler" "$watch_dir:w" &
+        
+        log_info "Network change watcher started (monitoring $watch_dir)"
+    else
+        log_debug "Network watch directory not found: $watch_dir"
+    fi
+}
+
+
+# ==============================================================================
+# [ Main Execution Flow ]
 # ==============================================================================
 
 main() {
-    wait_for_boot
-   
+    # Wait for Android boot completion
+    wait_for_boot || exit 1
+    
+    # Additional delay for system stability
     sleep 5
     
-    [ ! -f "$START_SCRIPT" ] && exit 1
+    # Verify start script exists
+    [ ! -f "$START_SCRIPT" ] && {
+        log_error "Start script not found: $START_SCRIPT"
+        exit 1
+    }
+    
+    # Ensure start script is executable
     [ ! -x "$START_SCRIPT" ] && chmod +x "$START_SCRIPT" 2>/dev/null
     
-    /system/bin/sh "$START_SCRIPT" start >/dev/null 2>&1 &
+    # Launch module toggle watcher first (always active for reactive control)
+    start_inotify_module
+    
+    # Check if module is disabled (disable file exists)
+    if [ -f "$MAGISK_MOD_DIR/disable" ]; then
+        log_info "Module is disabled, skipping service start"
+        exit 0
+    fi
+    
+    # Start services synchronously (wait for completion)
+    log_info "Starting Flux services..."
+    /system/bin/sh "$START_SCRIPT" start
+    local start_result=$?
+    
+    # Only start network watcher AFTER services are fully up
+    if [ $start_result -eq 0 ]; then
+        start_inotify_net
+    else
+        log_error "Service start failed, skipping network watcher"
+    fi
 }
 
 main

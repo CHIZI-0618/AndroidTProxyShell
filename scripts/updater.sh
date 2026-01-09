@@ -369,11 +369,36 @@ validate_and_report() {
 
 
 # ==============================================================================
-# [ Entry Point ]
+# [ Update Interval Check ]
 # ==============================================================================
 
-main() {
-    load_flux_config
+# Check if enough time has passed since last update
+should_update() {
+    # If no timestamp file exists, should update
+    [ ! -f "$LAST_UPDATE_FILE" ] && return 0
+    
+    local last_update current_time elapsed
+    last_update=$(cat "$LAST_UPDATE_FILE" 2>/dev/null || echo 0)
+    current_time=$(date +%s)
+    elapsed=$((current_time - last_update))
+    
+    if [ "$elapsed" -ge "$UPDATE_INTERVAL" ]; then
+        log_debug "Update interval exceeded (${elapsed}s >= ${UPDATE_INTERVAL}s)"
+        return 0
+    else
+        local remaining=$((UPDATE_INTERVAL - elapsed))
+        log_debug "Update not needed yet (${remaining}s remaining)"
+        return 1
+    fi
+}
+
+
+# ==============================================================================
+# [ Update Execution ]
+# ==============================================================================
+
+# Execute the full update pipeline
+do_update() {
     log_info "Starting configuration update..."
     
     # Ensure cleanup on exit
@@ -390,13 +415,43 @@ main() {
     # Download CN IP list if enabled in config
     download_cn_ip_list
     
+    # Update timestamp
     date +%s > "$LAST_UPDATE_FILE"
     
     # Cleanup
     cleanup_temp_files
     
     log_info "Update completed"
+}
+
+
+# ==============================================================================
+# [ Entry Point ]
+# ==============================================================================
+
+main() {
+    load_flux_config
+    
+    local action="${1:-update}"
+    
+    case "$action" in
+        check)
+            # Called by start.sh - only update if interval exceeded
+            if should_update; then
+                log_info "Update interval exceeded, starting update..."
+                do_update
+            else
+                log_info "Skipping update (interval not reached)"
+            fi
+            ;;
+        update|*)
+            # Direct execution - force immediate update
+            log_info "Forcing immediate update..."
+            do_update
+            ;;
+    esac
+    
     exit 0
 }
 
-main
+main "$@"

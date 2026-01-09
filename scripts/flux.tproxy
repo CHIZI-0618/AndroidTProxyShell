@@ -19,7 +19,7 @@ export LOG_COMPONENT="Tproxy"
 # Check if a specific kernel configuration is enabled in /proc/config.gz
 check_kernel_feature() {
     if [ "$SKIP_CHECK_FEATURE" = "1" ]; then
-        log Debug "Kernel feature check skipped"
+        log_debug "Kernel feature check skipped"
         return 0
     fi
     

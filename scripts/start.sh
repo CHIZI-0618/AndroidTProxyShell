@@ -2,20 +2,26 @@
 
 
 # ==============================================================================
-# TProxyShell Service Manager (start.sh)
-# Description: Manages sing-box core lifecycle and TProxy firewall rules
+# Flux Service Manager (start.sh)
+# Description: Parallel orchestrator for Core and TProxy services
+#              Manages lifecycle with state files and rollback on failure
 # ==============================================================================
+
 
 # ------------------------------------------------------------------------------
 # [ Load Dependencies ]
 # ------------------------------------------------------------------------------
+
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.config"
 . "$SCRIPT_DIR/flux.logger"
-. "$SCRIPT_DIR/flux.core"
 
-# Set log component name for logging function
+# Set log component name
 export LOG_COMPONENT="Manager"
+
+# State files for tracking service status
+readonly CORE_READY_FILE="$RUN_DIR/.core_ready"
+readonly TPROXY_READY_FILE="$RUN_DIR/.tproxy_ready"
 
 
 # ==============================================================================
@@ -40,7 +46,7 @@ init_environment() {
 
 # Check integrity of required files and permissions
 check_resource_integrity() {
-    local required_files="$SING_BOX_BIN $CONFIG_FILE $SETTINGS_FILE $TPROXY_SCRIPT $UPDATE_SCRIPT"
+    local required_files="$SING_BOX_BIN $CONFIG_FILE $SETTINGS_FILE $TPROXY_SCRIPT"
     local missing_files=""
     
     for file in $required_files; do
@@ -54,7 +60,7 @@ check_resource_integrity() {
         return 1
     fi
     
-    local executable_files="$SING_BOX_BIN $TPROXY_SCRIPT $UPDATE_SCRIPT"
+    local executable_files="$SING_BOX_BIN $TPROXY_SCRIPT"
     
     for file in $executable_files; do
         if [ ! -x "$file" ]; then
@@ -73,101 +79,139 @@ check_resource_integrity() {
 
 
 # ==============================================================================
-# [ TProxy Execution ]
+# [ State File Management ]
 # ==============================================================================
 
-execute_tproxy() {
-    local action="$1"
-    
-    log_debug "TProxy: $action"
-    
-    [ ! -f "$TPROXY_SCRIPT" ] && {
-        log_error "TProxy script missing"
-        return 1
-    }
-    
-    sh "$TPROXY_SCRIPT" "$action"
-    local ret=$?
-    
-    if [ $ret -eq 0 ]; then
-        log_info "TProxy $action done"
-        return 0
-    else
-        log_error "TProxy $action failed"
-        return 1
-    fi
+# Clean old state files before starting
+clean_state_files() {
+    rm -f "$CORE_READY_FILE" "$TPROXY_READY_FILE" 2>/dev/null
+    log_debug "State files cleaned"
+}
+
+# Create state file to indicate service is ready
+create_core_ready() {
+    touch "$CORE_READY_FILE"
+    log_debug "Core ready state created"
+}
+
+create_tproxy_ready() {
+    touch "$TPROXY_READY_FILE"
+    log_debug "TProxy ready state created"
+}
+
+# Check if services are ready
+is_tproxy_active() {
+    [ -f "$TPROXY_READY_FILE" ]
 }
 
 
 # ==============================================================================
-# [ Concurrent Start/Stop with Rollback ]
+# [ Parallel Start with Rollback ]
 # ==============================================================================
 
 start_parallel() {
-    log_info "Starting services..."
+    log_info "Starting services in parallel..."
     
     local core_result=0
     local tproxy_result=0
     local core_pid tproxy_pid
     
-    (start_core; exit $?) &
+    # Clean old state files first
+    clean_state_files
+    
+    # Start Core in background subshell
+    (
+        sh "$SCRIPT_DIR/flux.core" start
+        exit $?
+    ) &
     core_pid=$!
     
-    (execute_tproxy "start"; exit $?) &
+    # Start TProxy in background subshell
+    (
+        sh "$TPROXY_SCRIPT" start
+        exit $?
+    ) &
     tproxy_pid=$!
     
+    # Wait for both to complete
     wait $core_pid
     core_result=$?
     
     wait $tproxy_pid
     tproxy_result=$?
     
+    # Evaluate results and handle rollback
     if [ $core_result -ne 0 ] && [ $tproxy_result -ne 0 ]; then
         log_error "All services failed"
+        prop_error
         return 1
     elif [ $core_result -ne 0 ]; then
-        log_error "Core failed, rollback TProxy"
-        execute_tproxy "stop" >/dev/null 2>&1 || true
+        log_error "Core failed, rolling back TProxy"
+        sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 || true
+        prop_error
         return 1
     elif [ $tproxy_result -ne 0 ]; then
-        log_error "TProxy failed, rollback Core"
-        stop_core >/dev/null 2>&1 || true
+        log_error "TProxy failed, rolling back Core"
+        sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 || true
+        prop_error
         return 1
     fi
     
-    log_info "All services started"
+    # Both succeeded - create state files
+    create_core_ready
+    create_tproxy_ready
+    
+    log_info "All services started successfully"
     return 0
 }
 
+
+# ==============================================================================
+# [ Parallel Stop ]
+# ==============================================================================
+
 stop_parallel() {
-    log_info "Stopping services..."
+    log_info "Stopping services in parallel..."
     
     local core_pid tproxy_pid
     
-    (stop_core) &
+    # Stop Core in background
+    (sh "$SCRIPT_DIR/flux.core" stop) &
     core_pid=$!
     
-    (execute_tproxy "stop") &
+    # Stop TProxy in background
+    (sh "$TPROXY_SCRIPT" stop) &
     tproxy_pid=$!
     
+    # Wait for both to complete
     wait $core_pid
     wait $tproxy_pid
+    
+    # Clean state files
+    clean_state_files
     
     log_info "All services stopped"
     return 0
 }
 
+
+# ==============================================================================
+# [ Force Cleanup ]
+# ==============================================================================
+
 force_cleanup() {
     log_debug "Force cleanup..."
     
-    (stop_core >/dev/null 2>&1) &
+    (sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1) &
     local core_pid=$!
     
-    (execute_tproxy "stop" >/dev/null 2>&1) &
+    (sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1) &
     local tproxy_pid=$!
     
     wait $core_pid 2>/dev/null
     wait $tproxy_pid 2>/dev/null
+    
+    clean_state_files
 }
 
 
@@ -179,14 +223,13 @@ start_service_sequence() {
     init_environment || return 1
     check_resource_integrity || return 1
     
-    
     # Clean any stale state
     force_cleanup
     
-    # Validate config (fatal if fails)
-    if ! validate_singbox_config; then
-        log_error "Config invalid"
-        return 1
+    # Check for subscription updates (interval-based)
+    if [ -f "$UPDATE_SCRIPT" ]; then
+        log_debug "Checking for subscription updates..."
+        sh "$UPDATE_SCRIPT" check || log_debug "Update check completed"
     fi
     
     # Parallel start with rollback
@@ -228,8 +271,13 @@ main() {
         stop)
             stop_service_sequence || exit_code=1
             ;;
+        restart)
+            stop_service_sequence
+            sleep 1
+            start_service_sequence || exit_code=1
+            ;;
         *)
-            echo "Usage: $0 {start|stop}"
+            echo "Usage: $0 {start|stop|restart}"
             exit_code=1
             ;;
     esac

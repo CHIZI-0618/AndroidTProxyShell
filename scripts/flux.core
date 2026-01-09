@@ -4,8 +4,25 @@
 # ==============================================================================
 # Flux Core Management (flux.core)
 # Description: Manages sing-box core process lifecycle (start/stop/restart)
+#              Standalone executable with argument-based control
 # ==============================================================================
 
+
+# ------------------------------------------------------------------------------
+# [ Environment Setup ]
+# ------------------------------------------------------------------------------
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
+
+# Set log component name
+export LOG_COMPONENT="Core"
+
+
+# ==============================================================================
+# [ Configuration Validation ]
+# ==============================================================================
 
 # Validate sing-box JSON configuration syntax
 validate_singbox_config() {
@@ -26,6 +43,12 @@ validate_singbox_config() {
     return 0
 }
 
+
+# ==============================================================================
+# [ Core Status Check ]
+# ==============================================================================
+
+# Check if core process is running and port is listening
 is_core_running() {
     local pid_file="$PID_FILE"
     local pid
@@ -37,18 +60,40 @@ is_core_running() {
     netstat -tunlp 2>/dev/null | grep -q ":${PROXY_TCP_PORT}.*LISTEN"
 }
 
-# Start sing-box core process and verify PID
+
+# ==============================================================================
+# [ Core Start ]
+# ==============================================================================
+
+# Start sing-box core process in background, write PID, wait for port
 start_core() {
     log_debug "Starting sing-box..."
     
-    nohup "$SING_BOX_BIN" run \
-        -c "$CONFIG_FILE" \
-        -D "$RUN_DIR" \
-        >/dev/null 2>&1 &
+    # Ensure run directory exists
+    [ ! -d "$RUN_DIR" ] && mkdir -p "$RUN_DIR"
+    
+    # Set ulimit for better connection handling
+    ulimit -SHn 1000000 2>/dev/null
+    
+    # Launch sing-box with busybox setuidgid (box4magisk pattern)
+    # Fall back to direct execution if busybox not available
+    if command -v busybox >/dev/null 2>&1; then
+        nohup busybox setuidgid "${CORE_USER}:${CORE_GROUP}" \
+            "$SING_BOX_BIN" run \
+            -c "$CONFIG_FILE" \
+            -D "$RUN_DIR" \
+            >/dev/null 2>"$RUN_DIR/error_core.log" &
+    else
+        nohup "$SING_BOX_BIN" run \
+            -c "$CONFIG_FILE" \
+            -D "$RUN_DIR" \
+            >/dev/null 2>"$RUN_DIR/error_core.log" &
+    fi
     
     local pid=$!
-    echo "$pid" > "$PID_FILE"
+    echo -n "$pid" > "$PID_FILE"
     
+    # Wait for port to be listening (with timeout)
     local start_wait_count=0
     while [ $start_wait_count -lt "$CORE_TIMEOUT" ]; do
         
@@ -61,10 +106,15 @@ start_core() {
         start_wait_count=$((start_wait_count + 1))
     done
     
-    log_error "Core start failed"
+    log_error "Core start failed (timeout), check $RUN_DIR/error_core.log"
     stop_core
     return 1
 }
+
+
+# ==============================================================================
+# [ Core Stop ]
+# ==============================================================================
 
 # Stop sing-box core process gracefully (SIGTERM -> SIGKILL)
 stop_core() {
@@ -76,12 +126,14 @@ stop_core() {
             log_debug "Stopping PID $pid"
             kill "$pid" 2>/dev/null
             
+            # Wait for graceful shutdown
             local stop_wait_count=0
             while kill -0 "$pid" 2>/dev/null && [ $stop_wait_count -lt "$CORE_TIMEOUT" ]; do
                 sleep 0.5
                 stop_wait_count=$((stop_wait_count + 1))
             done
             
+            # Force kill if still running
             if kill -0 "$pid" 2>/dev/null; then
                 log_debug "Force killing $pid"
                 kill -9 "$pid" 2>/dev/null
@@ -89,6 +141,7 @@ stop_core() {
             fi
         fi
     else
+        # Fallback: kill by pattern if no PID file
         pkill -9 -f "sing-box.*run.*$CONFIG_FILE" 2>/dev/null
     fi
     
@@ -96,9 +149,62 @@ stop_core() {
     log_info "Core stopped"
 }
 
+
+# ==============================================================================
+# [ Core Restart ]
+# ==============================================================================
+
 # Restart core (stop then start)
 restart_core() {
+    log_info "Restarting core..."
     stop_core
     sleep 1
-    start_core
+    validate_singbox_config && start_core
 }
+
+
+# ==============================================================================
+# [ Main Entry Point ]
+# ==============================================================================
+
+main() {
+    # Load configuration
+    load_flux_config
+    
+    local action="${1:-}"
+    local exit_code=0
+    
+    case "$action" in
+        start)
+            if is_core_running; then
+                log_info "Core already running"
+                exit 0
+            fi
+            validate_singbox_config || exit 1
+            start_core || exit_code=1
+            ;;
+        stop)
+            stop_core || exit_code=1
+            ;;
+        restart)
+            restart_core || exit_code=1
+            ;;
+        is_running)
+            if is_core_running; then
+                echo "running"
+                exit 0
+            else
+                echo "stopped"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Usage: $0 {start|stop|restart|is_running}"
+            exit_code=1
+            ;;
+    esac
+    
+    exit $exit_code
+}
+
+main "$@"

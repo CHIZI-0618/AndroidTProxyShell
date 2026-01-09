@@ -1,0 +1,60 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux Network Change Listener (flux.net.inotify)
+# Description: Anti-loopback - add local IPs to BYPASS chains on network change
+# Pattern: Based on box4magisk net.inotify
+# ==============================================================================
+
+events=$1
+# monitor_dir=$2
+# monitor_file=$3
+
+scripts=$(realpath "$0")
+scripts_dir=$(dirname "${scripts}")
+
+source "${scripts_dir}/flux.config"
+
+export TZ=Asia/Shanghai
+
+# State file for TProxy status
+TPROXY_READY_FILE="${RUN_DIR}/.tproxy_ready"
+
+# Only run if TProxy is active
+[ ! -f "${TPROXY_READY_FILE}" ] && exit 0
+
+# Only handle write events
+[ "${events}" != "w" ] && exit 0
+
+mkdir -p "${RUN_DIR}"
+
+rules_add() {
+    # IPv4 anti-loopback rules
+    ip -4 a | awk '/inet/ {print $2}' | grep -vE "^127.0.0.1" | while read -r local_ipv4; do
+        iptables -w 100 -t mangle -A BYPASS_IP -d "$local_ipv4" -p udp ! --dport 53 -j ACCEPT
+        iptables -w 100 -t mangle -A BYPASS_IP -d "$local_ipv4" ! -p udp -j ACCEPT
+        rv1=$?
+        iptables -w 100 -t nat -A BYPASS_IP -d "$local_ipv4" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+        iptables -w 100 -t nat -A BYPASS_IP -d "$local_ipv4" ! -p udp -j ACCEPT 2>/dev/null
+        rv2=$?
+        ([ $rv1 = "0" ] || [ $rv2 = "0" ]) && \
+            echo "$(date +"%Y-%m-%d %H:%M:%S") [Info]: local ip is $local_ipv4, anti-loopback rule inserted" >> "${LOG_FILE}" 2>&1
+    done
+
+    # IPv6 anti-loopback rules (only if IPv6 proxy enabled)
+    load_flux_config
+    if [ "${PROXY_IPV6}" = "1" ]; then
+        ip -6 a | awk '/inet6/ {print $2}' | grep -vE "^fe80|^::1" | while read -r local_ipv6; do
+            ip6tables -w 100 -t mangle -A BYPASS_IP6 -d "$local_ipv6" -p udp ! --dport 53 -j ACCEPT
+            ip6tables -w 100 -t mangle -A BYPASS_IP6 -d "$local_ipv6" ! -p udp -j ACCEPT
+            rv1=$?
+            ip6tables -w 100 -t nat -A BYPASS_IP6 -d "$local_ipv6" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+            ip6tables -w 100 -t nat -A BYPASS_IP6 -d "$local_ipv6" ! -p udp -j ACCEPT 2>/dev/null
+            rv2=$?
+            ([ $rv1 = "0" ] || [ $rv2 = "0" ]) && \
+                echo "$(date +"%Y-%m-%d %H:%M:%S") [Info]: local ip is $local_ipv6, anti-loopback rule inserted" >> "${LOG_FILE}" 2>&1
+        done
+    fi
+}
+
+rules_add
