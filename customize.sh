@@ -105,12 +105,31 @@ migrate_settings() {
     
     ui_print "  > Migrating settings (incremental)..."
     
-    # List of keys to migrate (user-customizable settings)
-    local keys="SUBSCRIPTION_URL UPDATE_INTERVAL PROXY_MODE DNS_HIJACK_ENABLE"
-    keys="$keys PROXY_TCP_PORT PROXY_UDP_PORT DNS_PORT ROUTING_MARK"
-    keys="$keys PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_IPV6"
+    # List of keys to migrate (all user-customizable settings)
+    # Subscription
+    local keys="SUBSCRIPTION_URL"
+    # Logging
+    keys="$keys LOG_ENABLE LOG_LEVEL LOG_MAX_SIZE"
+    # Timeouts
+    keys="$keys CORE_TIMEOUT UPDATE_TIMEOUT RETRY_COUNT UPDATE_INTERVAL"
+    # Routing
+    keys="$keys ROUTING_MARK"
+    # Ports
+    keys="$keys PROXY_TCP_PORT PROXY_UDP_PORT DNS_PORT"
+    # Proxy Mode
+    keys="$keys PROXY_MODE DNS_HIJACK_ENABLE"
+    # Network Interfaces
+    keys="$keys MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE"
+    # Proxy Scope
+    keys="$keys PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_TCP PROXY_UDP PROXY_IPV6"
+    # Per-App Proxy
     keys="$keys APP_PROXY_ENABLE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_APPS_LIST"
-    keys="$keys BYPASS_CN_IP MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST"
+    # CN IP Bypass
+    keys="$keys BYPASS_CN_IP CN_IP_URL CN_IPV6_URL"
+    # MAC Filter
+    keys="$keys MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST"
+    # Advanced
+    keys="$keys SKIP_CHECK_FEATURE"
     
     for key in $keys; do
         # Use awk to extract value (handles multi-line quoted values)
@@ -205,8 +224,8 @@ main() {
             cp -f "$CONF_DIR/config.json" "$TMP_BACKUP/config.json"
             has_config=true
             # Also backup update_timestamp if exists (synced with config.json)
-            if [ -f "$STATE_DIR/update_timestamp" ]; then
-                cp -f "$STATE_DIR/update_timestamp" "$TMP_BACKUP/update_timestamp"
+            if [ -f "$STATE_DIR/.last_update" ]; then
+                cp -f "$STATE_DIR/.last_update" "$TMP_BACKUP/.last_update"
                 has_timestamp=true
             fi
         fi
@@ -252,18 +271,18 @@ main() {
         ui_print "- Using default settings.ini"
     fi
     
-    # 4.2 config.json + update_timestamp - User choice (synced together)
+    # 4.2 config.json + .last_update - User choice (synced together)
     if [ "$has_config" = "true" ]; then
         if choose_action "Keep [config.json]?" "true"; then
             cp -f "$TMP_BACKUP/config.json" "$CONF_DIR/config.json"
-            # Restore update_timestamp if it was backed up
+            # Restore .last_update if it was backed up
             if [ "$has_timestamp" = "true" ]; then
-                cp -f "$TMP_BACKUP/update_timestamp" "$STATE_DIR/update_timestamp"
+                cp -f "$TMP_BACKUP/.last_update" "$STATE_DIR/.last_update"
             fi
             ui_print "  > config.json: restored"
         else
-            # Reset config.json means also delete update_timestamp
-            rm -f "$STATE_DIR/update_timestamp" 2>/dev/null
+            # Reset config.json means also delete .last_update
+            rm -f "$STATE_DIR/.last_update" 2>/dev/null
             ui_print "  > config.json: reset to default"
         fi
     fi

@@ -19,9 +19,46 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 # Set log component name
 export LOG_COMPONENT="Manager"
 
-# State files for tracking service status
-readonly CORE_READY_FILE="$STATE_DIR/.core_ready"
-readonly TPROXY_READY_FILE="$STATE_DIR/.tproxy_ready"
+
+# ==============================================================================
+# [ File Lock Mechanism ]
+# ==============================================================================
+
+# Acquire exclusive lock - blocks until lock is available or timeout
+acquire_lock() {
+    local count=0
+    
+    # Ensure state directory exists
+    [ ! -d "$STATE_DIR" ] && mkdir -p "$STATE_DIR"
+    
+    # Check if lock exists and is stale (process died)
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    
+    # Wait for lock with timeout
+    while [ -f "$LOCK_FILE" ]; do
+        [ $count -ge $LOCK_TIMEOUT ] && return 1
+        sleep 1
+        count=$((count + 1))
+    done
+    
+    # Acquire lock
+    echo $$ > "$LOCK_FILE"
+    trap 'release_lock' EXIT INT TERM
+    return 0
+}
+
+# Release lock
+release_lock() {
+    [ -f "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
+    trap - EXIT INT TERM
+}
+
 
 
 # ==============================================================================
@@ -161,7 +198,7 @@ start_parallel() {
     create_core_ready
     create_tproxy_ready
     
-    log_info "All services started successfully"
+    log_info "Parallel start complete"
     return 0
 }
 
@@ -190,7 +227,7 @@ stop_parallel() {
     # Clean state files
     clean_state_files
     
-    log_info "All services stopped"
+    log_info "Parallel stop complete"
     return 0
 }
 

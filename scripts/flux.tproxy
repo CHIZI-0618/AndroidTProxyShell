@@ -844,6 +844,9 @@ start_proxy() {
     block_loopback_traffic enable
     ping_fix enable
     
+    # Start IP monitor for dynamic anti-loopback
+    start_ip_monitor
+    
     log_info "Proxy setup completed"
 }
 
@@ -857,7 +860,7 @@ stop_proxy() {
             cleanup_routing6
         fi
     else
-        log_info "Cleaning up REDIRECT chains"
+        log_debug "Cleaning up REDIRECT chains"
         cleanup_redirect_chain4
         if [ "$PROXY_IPV6" -eq 1 ]; then
             cleanup_redirect_chain6
@@ -867,6 +870,9 @@ stop_proxy() {
     cleanup_ipset
     block_loopback_traffic disable
     ping_fix disable
+    
+    # Stop IP monitor
+    stop_ip_monitor
     
     log_info "Proxy stopped"
 }
@@ -909,6 +915,34 @@ ping_fix() {
             log_debug "Ping fix disabled"
             ;;
     esac
+}
+
+# Start IP address monitor daemon for dynamic anti-loopback
+start_ip_monitor() {
+    local monitor_script="$SCRIPTS_DIR/flux.ip.monitor"
+    
+    if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
+        chmod +x "$monitor_script" 2>/dev/null
+        # Start in background, detached from terminal
+        nohup sh "$monitor_script" start >/dev/null 2>&1 &
+        log_debug "IP monitor daemon started"
+    else
+        log_debug "IP monitor script not found, skipping"
+    fi
+}
+
+# Stop IP address monitor daemon
+stop_ip_monitor() {
+    local monitor_script="$SCRIPTS_DIR/flux.ip.monitor"
+    
+    if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
+        sh "$monitor_script" stop 2>/dev/null
+    fi
+    
+    # Fallback: kill by pattern
+    pkill -f "flux.ip.monitor" 2>/dev/null || true
+    pkill -f "ip monitor address" 2>/dev/null || true
+    log_debug "IP monitor daemon stopped"
 }
 
 main() {

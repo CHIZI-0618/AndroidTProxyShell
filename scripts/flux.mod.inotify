@@ -10,6 +10,12 @@ scripts=$(realpath "$0")
 scripts_dir=$(dirname "${scripts}")
 
 . "${scripts_dir}/flux.config"
+. "${scripts_dir}/flux.logger"
+
+# Load user configuration
+load_flux_config
+
+export LOG_COMPONENT="Inotify"
 
 service_path="${scripts_dir}/start.sh"
 

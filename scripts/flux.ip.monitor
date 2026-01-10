@@ -1,0 +1,216 @@
+﻿#!/system/bin/sh
+
+# ==============================================================================
+# Flux IP Monitor Daemon (flux.ip.monitor)
+# Description: Monitors IP address changes and dynamically updates anti-loopback
+#              rules to prevent traffic loops with temporary IPv6 addresses
+# ==============================================================================
+
+scripts=$(realpath "$0")
+scripts_dir=$(dirname "${scripts}")
+
+. "${scripts_dir}/flux.config"
+. "${scripts_dir}/flux.logger"
+
+# Load user configuration
+load_flux_config
+
+export LOG_COMPONENT="IPMonitor"
+
+# ------------------------------------------------------------------------------
+# [ Rule Management ]
+# ------------------------------------------------------------------------------
+
+# Add anti-loopback rule for an IP address
+add_bypass_rule() {
+    local ip="$1"
+    local family="$2"  # 4 or 6
+    
+    # Check cache first (faster than iptables -C)
+    # This also prevents duplicate logs from ip monitor attribute update events
+    if grep -qF "$ip" "$IP_CACHE_FILE" 2>/dev/null; then
+        return 0
+    fi
+    
+    local cmd="iptables"
+    local chain="BYPASS_IP"
+    
+    if [ "$family" = "6" ]; then
+        cmd="ip6tables"
+        chain="BYPASS_IP6"
+    fi
+    
+    # Add rules
+    $cmd -w 10 -t mangle -A "$chain" -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+    $cmd -w 10 -t mangle -A "$chain" -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
+    
+    # Add to cache
+    echo "$ip" >> "$IP_CACHE_FILE"
+    
+    log_debug "Added bypass rule for $ip"
+}
+
+# Remove anti-loopback rule for an IP address
+del_bypass_rule() {
+    local ip="$1"
+    local family="$2"
+    
+    # Check cache - if not in cache, rule wasn't added by us
+    if ! grep -qF "$ip" "$IP_CACHE_FILE" 2>/dev/null; then
+        return 0
+    fi
+    
+    local cmd="iptables"
+    local chain="BYPASS_IP"
+    
+    if [ "$family" = "6" ]; then
+        cmd="ip6tables"
+        chain="BYPASS_IP6"
+    fi
+    
+    # Remove rules
+    $cmd -w 10 -t mangle -D "$chain" -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+    $cmd -w 10 -t mangle -D "$chain" -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
+    
+    # Remove from cache (use temp file for portability)
+    grep -vF "$ip" "$IP_CACHE_FILE" > "$IP_CACHE_FILE.tmp" 2>/dev/null
+    mv -f "$IP_CACHE_FILE.tmp" "$IP_CACHE_FILE" 2>/dev/null
+    
+    log_debug "Removed bypass rule for $ip"
+}
+
+# ------------------------------------------------------------------------------
+# [ Event Parsing ]
+# ------------------------------------------------------------------------------
+
+# Parse ip monitor output and handle address events
+# Format examples:
+#   2: wlan0    inet 192.168.1.100/24 brd 192.168.1.255 ...
+#   Deleted 2: wlan0    inet6 2001:db8::1/64 ...
+handle_event() {
+    local line="$1"
+    
+    # Skip empty lines
+    [ -z "$line" ] && return
+    
+    # Determine if it's an add or delete event
+    local action="add"
+    if echo "$line" | grep -q "^Deleted"; then
+        action="del"
+        line=$(echo "$line" | sed 's/^Deleted //')
+    fi
+    
+    # Extract IP address with CIDR
+    local ip_cidr=""
+    local family=""
+    
+    if echo "$line" | grep -q "inet6"; then
+        # IPv6 address
+        ip_cidr=$(echo "$line" | grep -oE 'inet6 [0-9a-f:]+/[0-9]+' | awk '{print $2}')
+        family="6"
+        
+        # Skip link-local (fe80::) and loopback (::1)
+        echo "$ip_cidr" | grep -qE '^fe80:|^::1/' && return
+        
+    elif echo "$line" | grep -q "inet "; then
+        # IPv4 address
+        ip_cidr=$(echo "$line" | grep -oE 'inet [0-9.]+/[0-9]+' | awk '{print $2}')
+        family="4"
+        
+        # Skip loopback (127.x.x.x)
+        echo "$ip_cidr" | grep -qE '^127\.' && return
+    else
+        # Not an address line
+        return
+    fi
+    
+    [ -z "$ip_cidr" ] && return
+    
+    # Apply rule change
+    if [ "$action" = "add" ]; then
+        add_bypass_rule "$ip_cidr" "$family"
+    else
+        del_bypass_rule "$ip_cidr" "$family"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# [ Main Monitor Loop ]
+# ------------------------------------------------------------------------------
+
+# Sync existing IP addresses at startup
+sync_existing_addresses() {
+    log_debug "Syncing existing IP addresses..."
+    
+    # Get all current IPv4 addresses (skip loopback)
+    ip -4 addr show 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | awk '{print $2}' | while read -r ip; do
+        echo "$ip" | grep -qE '^127\.' && continue
+        add_bypass_rule "$ip" "4"
+    done
+    
+    # Get all current IPv6 addresses (skip link-local and loopback)
+    ip -6 addr show 2>/dev/null | grep -oE 'inet6 [0-9a-f:]+/[0-9]+' | awk '{print $2}' | while read -r ip; do
+        echo "$ip" | grep -qE '^fe80:|^::1/' && continue
+        add_bypass_rule "$ip" "6"
+    done
+    
+    log_debug "Existing addresses synced"
+}
+
+start_monitor() {
+    log_info "Starting IP address monitor..."
+    
+    # Clear IP cache for fresh start
+    : > "$IP_CACHE_FILE"
+    
+    # Write our PID
+    echo $$ > "$IP_MONITOR_PID_FILE"
+    
+    # Trap to clean up on exit
+    trap 'rm -f "$IP_MONITOR_PID_FILE" "$IP_CACHE_FILE"; exit 0' EXIT INT TERM
+    
+    # Sync existing addresses before monitoring new events
+    sync_existing_addresses
+    
+    # Run ip monitor and process events
+    ip monitor address 2>/dev/null | while read -r line; do
+        handle_event "$line"
+    done
+}
+
+stop_monitor() {
+    if [ -f "$IP_MONITOR_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$IP_MONITOR_PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            log_debug "IP monitor stopped (PID: $pid)"
+        fi
+        rm -f "$IP_MONITOR_PID_FILE"
+    fi
+    
+    # Also kill by pattern as fallback
+    pkill -f "ip monitor address" 2>/dev/null || true
+    
+    # Clean up cache file
+    rm -f "$IP_CACHE_FILE" 2>/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# [ Entry Point ]
+# ------------------------------------------------------------------------------
+
+case "${1:-start}" in
+    start)
+        # Kill any existing instance first
+        stop_monitor
+        start_monitor
+        ;;
+    stop)
+        stop_monitor
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac

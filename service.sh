@@ -17,6 +17,9 @@
 . "/data/adb/Flux/scripts/flux.config"
 . "/data/adb/Flux/scripts/flux.logger"
 
+# Load user configuration
+load_flux_config
+
 export LOG_COMPONENT="Service"
 
 
@@ -67,29 +70,6 @@ start_inotify_module() {
     log_info "Module toggle watcher started (monitoring $watch_dir)"
 }
 
-# Launch inotifyd watcher for network changes
-# Called AFTER services are fully started
-start_inotify_net() {
-    local handler="$SCRIPTS_DIR/flux.net.inotify"
-    local watch_dir="/data/misc/net"
-    
-    # Ensure handler is executable
-    [ -f "$handler" ] && chmod +x "$handler" 2>/dev/null
-    
-    # Only start if the watch directory exists
-    if [ -d "$watch_dir" ]; then
-        # Kill any existing instance
-        pkill -f "inotifyd.*flux.net.inotify" 2>/dev/null || true
-        
-        # Start inotifyd watching for write(w) events
-        inotifyd "$handler" "$watch_dir:w" &
-        
-        log_info "Network change watcher started (monitoring $watch_dir)"
-    else
-        log_debug "Network watch directory not found: $watch_dir"
-    fi
-}
-
 
 # ==============================================================================
 # [ Main Execution Flow ]
@@ -120,17 +100,9 @@ main() {
         exit 0
     fi
     
-    # Start services synchronously (wait for completion)
+    # Start services
     log_info "Starting Flux services..."
     /system/bin/sh "$START_SCRIPT" start
-    local start_result=$?
-    
-    # Only start network watcher AFTER services are fully up
-    if [ $start_result -eq 0 ]; then
-        start_inotify_net
-    else
-        log_error "Service start failed, skipping network watcher"
-    fi
 }
 
 main
