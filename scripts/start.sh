@@ -275,7 +275,11 @@ main() {
     
     # Load and validate configuration
     load_flux_config
-    validate_flux_config
+    validate_flux_config || {
+        log_error "Configuration validation failed"
+        release_lock
+        exit 1
+    }
     
     trap 'update_description; release_lock' EXIT
     

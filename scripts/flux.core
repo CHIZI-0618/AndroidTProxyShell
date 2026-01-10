@@ -145,7 +145,7 @@ stop_core() {
         pkill -9 -f "sing-box.*run.*$CONFIG_FILE" 2>/dev/null
     fi
     
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" 2>/dev/null
     log_info "Core stopped"
 }
 
