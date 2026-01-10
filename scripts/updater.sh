@@ -14,7 +14,6 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.config"
 . "$SCRIPT_DIR/flux.logger"
 
-export INTERACTIVE=1
 # Set log component name
 export LOG_COMPONENT="Update"
 

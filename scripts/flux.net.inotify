@@ -13,7 +13,7 @@ events=$1
 scripts=$(realpath "$0")
 scripts_dir=$(dirname "${scripts}")
 
-source "${scripts_dir}/flux.config"
+. "${scripts_dir}/flux.config"
 
 export TZ=Asia/Shanghai
 

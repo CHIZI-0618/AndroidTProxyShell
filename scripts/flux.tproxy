@@ -174,7 +174,7 @@ safe_chain_create() {
         cmd="ip6tables"
     fi
 
-    if [ "$DRY_RUN" -eq 1 ] || ! safe_chain_exists "$family" "$table" "$chain"; then
+    if ! safe_chain_exists "$family" "$table" "$chain"; then
         $cmd -t "$table" -N "$chain"
     fi
 
@@ -818,7 +818,7 @@ start_proxy() {
             log_error "Kernel does not support ipset (CONFIG_IP_SET, CONFIG_NETFILTER_XT_SET). Cannot bypass CN IPs"
             BYPASS_CN_IP=0
         else
-            download_cn_ip_list || log_warn "Failed to download CN IP list, continuing without it"
+            log_debug "CN IP bypass enabled, ipset will be loaded from files"
             if ! setup_cn_ipset; then
                 log_error "Failed to setup ipset, CN bypass disabled"
                 BYPASS_CN_IP=0
@@ -882,6 +882,7 @@ block_loopback_traffic() {
 }
 
 main() {
+    load_flux_config
     detect_proxy_mode
     
     local action="${1:-}"

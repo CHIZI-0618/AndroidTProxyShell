@@ -7,6 +7,14 @@
 
 SKIPUNZIP=1
 
+# --- Installation Environment Check ---
+if [ "$BOOTMODE" != true ]; then
+    ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ui_print "! Please install in Magisk/KernelSU/APatch Manager"
+    ui_print "! Install from Recovery is NOT supported"
+    abort "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+fi
+
 # --- Constants & Paths ---
 readonly FLUX_DIR="/data/adb/Flux"
 readonly CONF_DIR="$FLUX_DIR/conf"
@@ -16,9 +24,9 @@ readonly RUN_DIR="$FLUX_DIR/run"
 readonly TOOLS_DIR="$FLUX_DIR/tools"
 readonly MODPROP="$MODPATH/module.prop"
 
-# --- UI Functions ---
-ui_print() { echo "$1"; }
-ui_error() { ui_print "!!! $1"; }
+# --- UI Helper Functions ---
+# Note: ui_print is provided by Magisk/KernelSU/APatch installer
+ui_error() { ui_print "! $1"; }
 ui_success() { ui_print "√ $1"; }
 
 # --- Environment Detection ---
@@ -31,7 +39,7 @@ detect_env() {
     elif [ "$APATCH" = "true" ]; then
         ui_print "  > APatch: $APATCH_VER_CODE"
         sed -i "s/^name=.*/& (APatch)/" "$MODPROP" 2>/dev/null
-    elif [ -z "$MAGISK_VER" ]; then
+    elif [ -n "$MAGISK_VER" ]; then
         ui_print "  > Magisk: $MAGISK_VER ($MAGISK_VER_CODE)"
     else
         ui_print "  > Unknown Environment"
@@ -39,16 +47,7 @@ detect_env() {
 }
 
 # --- Universal Volume Key Detection ---
-# Captures input from any event device to detect Vol+ / Vol-
-check_key_event() {
-    local key_event="$1"
-    case "$key_event" in
-        *0073*) return 1 ;; # KEY_VOLUMEUP
-        *0072*) return 2 ;; # KEY_VOLUMEDOWN
-    esac
-    return 0
-}
-
+# Optimized: uses temp file + grep for reliable detection
 choose_action() {
     local title="$1"
     local default_action="$2" # true = Yes/Keep, false = No/Reset
@@ -66,61 +65,70 @@ choose_action() {
     while true; do
         local now
         now=$(date +%s)
-        if [ $((now - start_time)) -ge "$timeout_sec" ]; then
+        
+        # Capture volume key events to temp file
+        timeout 1 getevent -lc 1 2>&1 | grep KEY_VOLUME > "$TMPDIR/events"
+        
+        if [ $((now - start_time)) -gt "$timeout_sec" ]; then
             if [ "$default_action" = "true" ]; then
                 ui_print "  > Timeout. Default: [Yes/Keep]"
-                return 0
             else
                 ui_print "  > Timeout. Default: [No/Reset]"
-                return 1
             fi
-        fi
-
-        # Capture hex output from all input devices
-        local events
-        events=$(timeout 0.1 getevent -luc 1 2>&1)
-        
-        if echo "$events" | grep -q "0073"; then
+            break
+        elif grep -q KEY_VOLUMEUP "$TMPDIR/events"; then
             ui_print "  > Selected: [Yes/Keep]"
-            return 0
-        elif echo "$events" | grep -q "0072"; then
+            default_action="true"
+            break
+        elif grep -q KEY_VOLUMEDOWN "$TMPDIR/events"; then
             ui_print "  > Selected: [No/Reset]"
-            return 1
+            default_action="false"
+            break
         fi
     done
+    
+    # Clear event buffer after detection
+    timeout 1 getevent -cl >/dev/null 2>&1
+    
+    [ "$default_action" = "true" ] && return 0 || return 1
 }
 
-# --- Smart Config Restore ---
-# $1: Source (Backup), $2: Destination (New Default)
-restore_value() {
-    local key="$1"
-    local source="$2"
-    local dest="$3"
-    
-    local val
-    val=$(grep "^${key}=" "$source" | cut -d= -f2-)
-    
-    if [ -n "$val" ]; then
-        # Escape special characters for sed
-        # We need to escape /, &, and newlines eventually, but basic config usually simple
-        val_escaped=$(echo "$val" | sed 's/[\/&]/\\&/g')
-        sed -i "s|^${key}=.*|${key}=${val_escaped}|" "$dest"
-    fi
-}
-
+# --- Smart Config Restore (Incremental Update) ---
+# Merges old settings into new config: existing keys are replaced, missing keys are appended
 migrate_settings() {
     local backup_file="$1"
-    local new_file="$2"
+    local target_file="$2"
     
     [ ! -f "$backup_file" ] && return
     
-    ui_print "  > Migrating settings..."
+    ui_print "  > Migrating settings (incremental)..."
     
-    # List of keys to migrate
-    local keys="SUBSCRIPTION_URL PROXY_MODE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_CN_IP UPDATE_INTERVAL PROXY_TCP_PORT PROXY_UDP_PORT"
+    # List of keys to migrate (user-customizable settings)
+    local keys="SUBSCRIPTION_URL UPDATE_INTERVAL PROXY_MODE DNS_HIJACK_ENABLE"
+    keys="$keys PROXY_TCP_PORT PROXY_UDP_PORT DNS_PORT ROUTING_MARK"
+    keys="$keys PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_IPV6"
+    keys="$keys APP_PROXY_ENABLE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_APPS_LIST"
+    keys="$keys BYPASS_CN_IP MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST"
     
     for key in $keys; do
-        restore_value "$key" "$backup_file" "$new_file"
+        # Get the full line from backup
+        local value_line
+        value_line=$(grep "^${key}=" "$backup_file")
+        
+        if [ -n "$value_line" ]; then
+            # Escape special characters for sed (including | as delimiter)
+            local esc_value
+            esc_value=$(printf '%s\n' "$value_line" | sed -e 's/[&/\|]/\\&/g')
+            
+            if grep -q "^${key}=" "$target_file"; then
+                # Key exists in new config: replace it
+                sed -i "s|^${key}=.*|${esc_value}|" "$target_file"
+            else
+                # Key missing in new config: append it
+                echo "$value_line" >> "$target_file"
+            fi
+            ui_print "     ↳ $key: restored"
+        fi
     done
 }
 
@@ -129,51 +137,90 @@ migrate_settings() {
 main() {
     detect_env
     
-    # 1. Prepare Temporary Backup
+    # 1. Prepare Temporary Backup (4 config files)
     local TMP_BACKUP
     TMP_BACKUP=$(mktemp -d)
-    local HAS_BACKUP=false
+    
+    local has_settings=false
+    local has_config=false
+    local has_pref=false
+    local has_singbox=false
     
     if [ -d "$FLUX_DIR" ]; then
-        ui_print "- Backing up current version..."
+        ui_print "- Backing up current configuration..."
+        
         if [ -f "$CONF_DIR/settings.ini" ]; then
             cp -f "$CONF_DIR/settings.ini" "$TMP_BACKUP/settings.ini"
-            HAS_BACKUP=true
+            has_settings=true
         fi
-        # Backup other custom files if needed
-        [ -f "$CONF_DIR/config.json" ] && cp -f "$CONF_DIR/config.json" "$TMP_BACKUP/"
+        if [ -f "$CONF_DIR/config.json" ]; then
+            cp -f "$CONF_DIR/config.json" "$TMP_BACKUP/config.json"
+            has_config=true
+        fi
+        if [ -f "$TOOLS_DIR/pref.toml" ]; then
+            cp -f "$TOOLS_DIR/pref.toml" "$TMP_BACKUP/pref.toml"
+            has_pref=true
+        fi
+        if [ -f "$TOOLS_DIR/base/singbox.json" ]; then
+            cp -f "$TOOLS_DIR/base/singbox.json" "$TMP_BACKUP/singbox.json"
+            has_singbox=true
+        fi
     fi
     
     # 2. Extract New Files
     ui_print "- Extracting new module..."
     unzip -o "$ZIPFILE" -x 'META-INF/*' -x 'bin/*' -x 'conf/*' -x 'scripts/*' -x 'tools/*' -d "$MODPATH" >&2
     
-    # Create structure
-    mkdir -p "$FLUX_DIR" "$CONF_DIR" "$RUN_DIR" "$BIN_DIR" "$SCRIPTS_DIR" "$TOOLS_DIR"
+    # Create structure (keep run directory as-is)
+    mkdir -p "$FLUX_DIR" "$CONF_DIR" "$BIN_DIR" "$SCRIPTS_DIR" "$TOOLS_DIR"
+    [ ! -d "$RUN_DIR" ] && mkdir -p "$RUN_DIR"
     
     # Extract Core Files
     unzip -o "$ZIPFILE" "bin/*" "scripts/*" "conf/*" "tools/*" -d "$FLUX_DIR" >&2
     
-    # 3. Handle Configuration
-    local KEEP_CONFIG=true
+    # 3. Handle Configuration (each file independently)
+    ui_print " "
+    ui_print "=== Configuration Restore ==="
     
-    if [ "$HAS_BACKUP" = "true" ]; then
-        if choose_action "Migrate old configuration?" "true"; then
-            KEEP_CONFIG=true
-        else
-            KEEP_CONFIG=false
-        fi
-        
-        if [ "$KEEP_CONFIG" = "true" ]; then
+    # 3.1 settings.ini
+    if [ "$has_settings" = "true" ]; then
+        if choose_action "Keep [settings.ini]?" "true"; then
             migrate_settings "$TMP_BACKUP/settings.ini" "$CONF_DIR/settings.ini"
-            # Optional: Start with old config.json or fresh one? Usually fresh is safer unless we migrate it too.
-            # Here we only migrate settings.ini as requested for "Smart Restore"
-            ui_print "  > Settings migrated."
+            ui_print "  > settings.ini: migrated"
         else
-            ui_print "  > Using default configuration."
+            ui_print "  > settings.ini: reset to default"
         fi
-    else
-        ui_print "- No previous configuration found. Using defaults."
+    fi
+    
+    # 3.2 config.json
+    if [ "$has_config" = "true" ]; then
+        if choose_action "Keep [config.json]?" "true"; then
+            cp -f "$TMP_BACKUP/config.json" "$CONF_DIR/config.json"
+            ui_print "  > config.json: restored"
+        else
+            ui_print "  > config.json: reset to default"
+        fi
+    fi
+    
+    # 3.3 pref.toml
+    if [ "$has_pref" = "true" ]; then
+        if choose_action "Keep [pref.toml]?" "true"; then
+            cp -f "$TMP_BACKUP/pref.toml" "$TOOLS_DIR/pref.toml"
+            ui_print "  > pref.toml: restored"
+        else
+            ui_print "  > pref.toml: reset to default"
+        fi
+    fi
+    
+    # 3.4 singbox.json
+    if [ "$has_singbox" = "true" ]; then
+        if choose_action "Keep [singbox.json]?" "true"; then
+            mkdir -p "$TOOLS_DIR/base"
+            cp -f "$TMP_BACKUP/singbox.json" "$TOOLS_DIR/base/singbox.json"
+            ui_print "  > singbox.json: restored"
+        else
+            ui_print "  > singbox.json: reset to default"
+        fi
     fi
     
     # 4. Set Permissions
