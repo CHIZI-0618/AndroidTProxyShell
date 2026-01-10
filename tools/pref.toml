@@ -10,7 +10,7 @@ exclude_remarks = ["(expire|traffic|官网|到期|流量|剩余|套餐|重置|�
 
 # ===== 路径配置 =====
 base_path = "base" 
-singbox_rule_base = "base/all_base.tpl"
+singbox_rule_base = "base/singbox.json"
 
 # ===== 代理设置 =====
 proxy_config = "NONE"
@@ -39,7 +39,7 @@ replace = ""
 
 # 规则 2: 清除冗余关键词
 [[node_pref.rename_node]]
-match = "(家宽|三网|原生|倍率|游戏专线|中转)"
+match = "(家宽|三网|原生|倍率|游戏专线)"
 replace = ""
 
 # 规则 3: 清除多余空格

@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 
 
 # ==============================================================================
@@ -82,12 +82,12 @@ start_core() {
             "$SING_BOX_BIN" run \
             -c "$CONFIG_FILE" \
             -D "$RUN_DIR" \
-            >/dev/null 2>"$RUN_DIR/error_core.log" &
+            >/dev/null 2>>"$LOG_FILE" &
     else
         nohup "$SING_BOX_BIN" run \
             -c "$CONFIG_FILE" \
             -D "$RUN_DIR" \
-            >/dev/null 2>"$RUN_DIR/error_core.log" &
+            >/dev/null 2>>"$LOG_FILE" &
     fi
     
     local pid=$!
@@ -106,7 +106,7 @@ start_core() {
         start_wait_count=$((start_wait_count + 1))
     done
     
-    log_error "Core start failed (timeout), check $RUN_DIR/error_core.log"
+    log_error "Core start failed (timeout), check $LOG_FILE"
     stop_core
     return 1
 }
@@ -168,43 +168,24 @@ restart_core() {
 # ==============================================================================
 
 main() {
-    # Load configuration
     load_flux_config
     
     local action="${1:-}"
-    local exit_code=0
     
     case "$action" in
         start)
-            if is_core_running; then
-                log_info "Core already running"
-                exit 0
-            fi
+            is_core_running && { log_info "Core already running"; exit 0; }
             validate_singbox_config || exit 1
-            start_core || exit_code=1
+            start_core || exit 1
             ;;
         stop)
-            stop_core || exit_code=1
-            ;;
-        restart)
-            restart_core || exit_code=1
-            ;;
-        is_running)
-            if is_core_running; then
-                echo "running"
-                exit 0
-            else
-                echo "stopped"
-                exit 1
-            fi
+            stop_core || exit 1
             ;;
         *)
-            echo "Usage: $0 {start|stop|restart|is_running}"
-            exit_code=1
+            echo "Usage: $0 {start|stop}"
+            exit 1
             ;;
     esac
-    
-    exit $exit_code
 }
 
 main "$@"

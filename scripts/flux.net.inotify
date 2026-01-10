@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 
 # ==============================================================================
 # Flux Network Change Listener (flux.net.inotify)
@@ -18,7 +18,7 @@ scripts_dir=$(dirname "${scripts}")
 export TZ=Asia/Shanghai
 
 # State file for TProxy status
-TPROXY_READY_FILE="${RUN_DIR}/.tproxy_ready"
+TPROXY_READY_FILE="${STATE_DIR}/.tproxy_ready"
 
 # Only run if TProxy is active
 [ ! -f "${TPROXY_READY_FILE}" ] && exit 0

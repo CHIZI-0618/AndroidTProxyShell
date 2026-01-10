@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 
 # ==============================================================================
 # FLUX Installer (customize.sh)
@@ -21,6 +21,7 @@ readonly CONF_DIR="$FLUX_DIR/conf"
 readonly BIN_DIR="$FLUX_DIR/bin"
 readonly SCRIPTS_DIR="$FLUX_DIR/scripts"
 readonly RUN_DIR="$FLUX_DIR/run"
+readonly STATE_DIR="$FLUX_DIR/state"
 readonly TOOLS_DIR="$FLUX_DIR/tools"
 readonly MODPROP="$MODPATH/module.prop"
 
@@ -95,6 +96,7 @@ choose_action() {
 
 # --- Smart Config Restore (Incremental Update) ---
 # Merges old settings into new config: existing keys are replaced, missing keys are appended
+# Supports multi-line values (package lists with newlines inside quotes)
 migrate_settings() {
     local backup_file="$1"
     local target_file="$2"
@@ -111,22 +113,65 @@ migrate_settings() {
     keys="$keys BYPASS_CN_IP MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST"
     
     for key in $keys; do
-        # Get the full line from backup
-        local value_line
-        value_line=$(grep "^${key}=" "$backup_file")
+        # Use awk to extract value (handles multi-line quoted values)
+        local value
+        value=$(awk -v key="$key" '
+            BEGIN { found=0; in_quotes=0; value="" }
+            $0 ~ "^"key"=" {
+                found=1
+                # Get everything after KEY=
+                sub("^"key"=", "")
+                value = $0
+                # Count quotes to detect multi-line
+                n = gsub(/"/, "\"", value)
+                if (n == 1) {
+                    # Opening quote but no closing - multi-line value
+                    in_quotes=1
+                } else {
+                    # Single line value - print and exit
+                    print value
+                    exit
+                }
+                next
+            }
+            found && in_quotes {
+                value = value "\n" $0
+                # Check for closing quote
+                if (/"/) {
+                    in_quotes=0
+                    print value
+                    exit
+                }
+            }
+        ' "$backup_file")
         
-        if [ -n "$value_line" ]; then
-            # Escape special characters for sed (including | as delimiter)
-            local esc_value
-            esc_value=$(printf '%s\n' "$value_line" | sed -e 's/[&/\|]/\\&/g')
+        if [ -n "$value" ]; then
+            # Create temp file for the replacement
+            local tmp_file
+            tmp_file=$(mktemp)
             
-            if grep -q "^${key}=" "$target_file"; then
-                # Key exists in new config: replace it
-                sed -i "s|^${key}=.*|${esc_value}|" "$target_file"
-            else
-                # Key missing in new config: append it
-                echo "$value_line" >> "$target_file"
-            fi
+            # Use awk to replace or append the key in target file
+            awk -v key="$key" -v newval="$value" '
+                BEGIN { found=0; skip=0 }
+                $0 ~ "^"key"=" {
+                    found=1
+                    print key"="newval
+                    # Check if value continues on next lines
+                    n = gsub(/"/, "\"", $0)
+                    if (n == 1) skip=1
+                    next
+                }
+                skip {
+                    if (/"/) skip=0
+                    next
+                }
+                { print }
+                END {
+                    if (!found) print key"="newval
+                }
+            ' "$target_file" > "$tmp_file"
+            
+            mv -f "$tmp_file" "$target_file"
             ui_print "     ↳ $key: restored"
         fi
     done
@@ -137,7 +182,7 @@ migrate_settings() {
 main() {
     detect_env
     
-    # 1. Prepare Temporary Backup (4 config files)
+    # 1. Backup config files before overwriting
     local TMP_BACKUP
     TMP_BACKUP=$(mktemp -d)
     
@@ -145,64 +190,85 @@ main() {
     local has_config=false
     local has_pref=false
     local has_singbox=false
+    local has_timestamp=false
     
     if [ -d "$FLUX_DIR" ]; then
-        ui_print "- Backing up current configuration..."
+        ui_print "- Backing up configuration files..."
         
+        # Backup settings.ini (will auto-migrate)
         if [ -f "$CONF_DIR/settings.ini" ]; then
             cp -f "$CONF_DIR/settings.ini" "$TMP_BACKUP/settings.ini"
             has_settings=true
         fi
+        # Backup config.json (user choice) - with update_timestamp
         if [ -f "$CONF_DIR/config.json" ]; then
             cp -f "$CONF_DIR/config.json" "$TMP_BACKUP/config.json"
             has_config=true
+            # Also backup update_timestamp if exists (synced with config.json)
+            if [ -f "$STATE_DIR/update_timestamp" ]; then
+                cp -f "$STATE_DIR/update_timestamp" "$TMP_BACKUP/update_timestamp"
+                has_timestamp=true
+            fi
         fi
+        # Backup pref.toml (user choice)
         if [ -f "$TOOLS_DIR/pref.toml" ]; then
             cp -f "$TOOLS_DIR/pref.toml" "$TMP_BACKUP/pref.toml"
             has_pref=true
         fi
+        # Backup singbox.json template (user choice)
         if [ -f "$TOOLS_DIR/base/singbox.json" ]; then
             cp -f "$TOOLS_DIR/base/singbox.json" "$TMP_BACKUP/singbox.json"
             has_singbox=true
         fi
     fi
     
-    # 2. Extract New Files
-    ui_print "- Extracting new module..."
-    unzip -o "$ZIPFILE" -x 'META-INF/*' -x 'bin/*' -x 'conf/*' -x 'scripts/*' -x 'tools/*' -d "$MODPATH" >&2
+    # 2. Extract module files to MODPATH (for Magisk)
+    # Note: META-INF is handled automatically by Magisk installer, do not extract manually
+    ui_print "- Extracting module files..."
+    unzip -o "$ZIPFILE" 'module.prop' 'service.sh' 'webroot/*' -d "$MODPATH" >&2
     
-    # Create structure (keep run directory as-is)
-    mkdir -p "$FLUX_DIR" "$CONF_DIR" "$BIN_DIR" "$SCRIPTS_DIR" "$TOOLS_DIR"
+    # 3. Clear and recreate FLUX_DIR structure (ensures clean install)
+    ui_print "- Installing Flux core files..."
+    
+    # Remove old directories that will be fully replaced
+    rm -rf "$BIN_DIR" "$SCRIPTS_DIR" "$TOOLS_DIR" 2>/dev/null
+    
+    # Create fresh directory structure
+    mkdir -p "$FLUX_DIR" "$CONF_DIR" "$BIN_DIR" "$SCRIPTS_DIR" "$TOOLS_DIR" "$STATE_DIR"
     [ ! -d "$RUN_DIR" ] && mkdir -p "$RUN_DIR"
     
-    # Extract Core Files
-    unzip -o "$ZIPFILE" "bin/*" "scripts/*" "conf/*" "tools/*" -d "$FLUX_DIR" >&2
+    # Extract core files (bin, scripts, conf, tools) - full overwrite
+    unzip -o "$ZIPFILE" 'bin/*' 'scripts/*' 'conf/*' 'tools/*' -d "$FLUX_DIR" >&2
     
-    # 3. Handle Configuration (each file independently)
+    # 4. Handle configuration restoration
     ui_print " "
-    ui_print "=== Configuration Restore ==="
+    ui_print "=== Configuration ==="
     
-    # 3.1 settings.ini
+    # 4.1 settings.ini - Auto migrate (no user confirmation needed)
     if [ "$has_settings" = "true" ]; then
-        if choose_action "Keep [settings.ini]?" "true"; then
-            migrate_settings "$TMP_BACKUP/settings.ini" "$CONF_DIR/settings.ini"
-            ui_print "  > settings.ini: migrated"
-        else
-            ui_print "  > settings.ini: reset to default"
-        fi
+        ui_print "- Migrating settings.ini..."
+        migrate_settings "$TMP_BACKUP/settings.ini" "$CONF_DIR/settings.ini"
+    else
+        ui_print "- Using default settings.ini"
     fi
     
-    # 3.2 config.json
+    # 4.2 config.json + update_timestamp - User choice (synced together)
     if [ "$has_config" = "true" ]; then
         if choose_action "Keep [config.json]?" "true"; then
             cp -f "$TMP_BACKUP/config.json" "$CONF_DIR/config.json"
+            # Restore update_timestamp if it was backed up
+            if [ "$has_timestamp" = "true" ]; then
+                cp -f "$TMP_BACKUP/update_timestamp" "$STATE_DIR/update_timestamp"
+            fi
             ui_print "  > config.json: restored"
         else
+            # Reset config.json means also delete update_timestamp
+            rm -f "$STATE_DIR/update_timestamp" 2>/dev/null
             ui_print "  > config.json: reset to default"
         fi
     fi
     
-    # 3.3 pref.toml
+    # 4.3 pref.toml - User choice
     if [ "$has_pref" = "true" ]; then
         if choose_action "Keep [pref.toml]?" "true"; then
             cp -f "$TMP_BACKUP/pref.toml" "$TOOLS_DIR/pref.toml"
@@ -212,7 +278,7 @@ main() {
         fi
     fi
     
-    # 3.4 singbox.json
+    # 4.4 singbox.json - User choice
     if [ "$has_singbox" = "true" ]; then
         if choose_action "Keep [singbox.json]?" "true"; then
             mkdir -p "$TOOLS_DIR/base"
@@ -223,18 +289,21 @@ main() {
         fi
     fi
     
-    # 4. Set Permissions
+    # 5. Set Permissions
     ui_print "- Setting permissions..."
     set_perm_recursive "$MODPATH" 0 0 0755 0644
     set_perm_recursive "$FLUX_DIR" 0 0 0755 0644
+    
+    # Executables
     set_perm_recursive "$BIN_DIR" 0 0 0755 0755
     set_perm_recursive "$SCRIPTS_DIR" 0 0 0755 0755
-    
     chmod +x "$TOOLS_DIR/jq" 2>/dev/null
     chmod +x "$TOOLS_DIR/subconverter" 2>/dev/null
-    chmod 0777 "$RUN_DIR"
     
-    # 5. Cleanup
+    # RUN_DIR needs write access for runtime files
+    chmod 0755 "$RUN_DIR"
+    
+    # 6. Cleanup
     rm -rf "$TMP_BACKUP"
     rm -rf "$FLUX_DIR/tmp" 2>/dev/null
     
@@ -242,4 +311,3 @@ main() {
 }
 
 main
-

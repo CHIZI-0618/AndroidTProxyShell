@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 
 
 # ==============================================================================
@@ -16,15 +16,16 @@ export LOG_COMPONENT="Tproxy"
 # KERNEL & SYSTEM FEATURE DETECTION
 # ==============================================================================
 
-# Check if a specific kernel configuration is enabled in /proc/config.gz
+# Check if a kernel feature is enabled via /proc/config.gz
 check_kernel_feature() {
-    if [ "$SKIP_CHECK_FEATURE" = "1" ]; then
-        log_debug "Kernel feature check skipped"
-        return 0
-    fi
-    
     local feature="$1"
     local config_name="CONFIG_${feature}"
+    
+    # Skip check if configured
+    if [ "$SKIP_CHECK_FEATURE" = "1" ]; then
+        log_debug "Kernel feature check skipped for $feature"
+        return 0
+    fi
 
     if [ -f /proc/config.gz ]; then
         if zcat /proc/config.gz 2> /dev/null | grep -qE "^${config_name}=[ym]$"; then
@@ -841,6 +842,7 @@ start_proxy() {
     fi
     
     block_loopback_traffic enable
+    ping_fix enable
     
     log_info "Proxy setup completed"
 }
@@ -864,6 +866,7 @@ stop_proxy() {
     
     cleanup_ipset
     block_loopback_traffic disable
+    ping_fix disable
     
     log_info "Proxy stopped"
 }
@@ -875,8 +878,35 @@ block_loopback_traffic() {
             iptables -t filter -A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
             ;;
         disable)
-            ip6tables -t filter -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
-            iptables -t filter -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
+            ip6tables -t filter -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null
+            iptables -t filter -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null
+            ;;
+    esac
+}
+
+# Ping fix: DNAT FakeIP ICMP to loopback so ping works (returns response from 127.0.0.1)
+ping_fix() {
+    # Get FakeIP range from config.json or fallback to settings.ini
+    get_fakeip_range
+    
+    case "$1" in
+        enable)
+            iptables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
+            iptables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
+            if [ "$PROXY_IPV6" = "1" ] && check_kernel_feature "IP6_NF_NAT"; then
+                ip6tables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
+                ip6tables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
+            fi
+            log_info "Ping fix enabled for FakeIP range ($FAKEIP_RANGE_V4)"
+            ;;
+        disable)
+            iptables -t nat -D OUTPUT -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1 2>/dev/null
+            iptables -t nat -D PREROUTING -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1 2>/dev/null
+            if [ "$PROXY_IPV6" = "1" ]; then
+                ip6tables -t nat -D OUTPUT -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1 2>/dev/null
+                ip6tables -t nat -D PREROUTING -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1 2>/dev/null
+            fi
+            log_debug "Ping fix disabled"
             ;;
     esac
 }

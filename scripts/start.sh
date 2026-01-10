@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 
 
 # ==============================================================================
@@ -20,8 +20,8 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 export LOG_COMPONENT="Manager"
 
 # State files for tracking service status
-readonly CORE_READY_FILE="$RUN_DIR/.core_ready"
-readonly TPROXY_READY_FILE="$RUN_DIR/.tproxy_ready"
+readonly CORE_READY_FILE="$STATE_DIR/.core_ready"
+readonly TPROXY_READY_FILE="$STATE_DIR/.tproxy_ready"
 
 
 # ==============================================================================
@@ -256,12 +256,29 @@ stop_service_sequence() {
 # ==============================================================================
 
 main() {
+    local action="${1:-}"
+    
+    # Validate action first
+    case "$action" in
+        start|stop) ;;
+        *)
+            echo "Usage: $0 {start|stop}"
+            exit 1
+            ;;
+    esac
+    
+    # Acquire lock to prevent concurrent operations
+    if ! acquire_lock; then
+        log_error "Another operation is in progress, please wait"
+        exit 1
+    fi
+    
+    # Load and validate configuration
     load_flux_config
     validate_flux_config
     
-    trap 'update_description' EXIT
+    trap 'update_description; release_lock' EXIT
     
-    local action="${1:-}"
     local exit_code=0
     
     case "$action" in
@@ -270,15 +287,6 @@ main() {
             ;;
         stop)
             stop_service_sequence || exit_code=1
-            ;;
-        restart)
-            stop_service_sequence
-            sleep 1
-            start_service_sequence || exit_code=1
-            ;;
-        *)
-            echo "Usage: $0 {start|stop|restart}"
-            exit_code=1
             ;;
     esac
     
