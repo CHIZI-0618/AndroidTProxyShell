@@ -590,34 +590,20 @@ ip6_route() {
 
 get_package_uid() {
     local pkg="$1"
-    local line
-    local uid
     if [ ! -r /data/system/packages.list ]; then
         log Error "Cannot read /data/system/packages.list"
         return 1
     fi
-    line=$(grep -m1 "^${pkg}[[:space:]]" /data/system/packages.list 2> /dev/null || true)
-    if [ -z "$line" ]; then
-        log Error "Package not found in packages.list: $pkg"
+
+    local uid
+    uid=$(awk -v pkg="$pkg" '$1 == pkg { if ($2 ~ /^[0-9]+$/) print $2; else if ($(NF-1) ~ /^[0-9]+$/) print $(NF-1); exit }' /data/system/packages.list)
+
+    if [ -z "$uid" ]; then
+        log Error "Package not found or invalid UID format: $pkg"
         return 1
     fi
 
-    uid=$(echo "$line" | awk '{print $2}' 2> /dev/null || true)
-    case "$uid" in
-        '' | *[!0-9]*)
-            uid=$(echo "$line" | awk '{print $(NF-1)}' 2> /dev/null || true)
-            ;;
-    esac
-    case "$uid" in
-        '' | *[!0-9]*)
-            log Error "Invalid UID format for package: $pkg"
-            return 1
-            ;;
-        *)
-            echo "$uid"
-            return 0
-            ;;
-    esac
+    echo "$uid"
 }
 
 find_packages_uid() {
