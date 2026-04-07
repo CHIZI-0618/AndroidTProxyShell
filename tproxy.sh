@@ -636,7 +636,7 @@ safe_chain_create() {
         cmd="ip6tables"
     fi
 
-    if ! safe_chain_exists "$family" "$table" "$chain"; then
+    if [ "$DRY_RUN" -eq 1 ] || ! safe_chain_exists "$family" "$table" "$chain"; then
         $cmd -t "$table" -N "$chain"
     fi
     $cmd -t "$table" -F "$chain"
