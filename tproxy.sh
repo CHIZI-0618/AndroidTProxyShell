@@ -2,7 +2,7 @@
 
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 # Version (use YY.MM.DD format)
-readonly SCRIPT_VERSION="v26.04.15"
+readonly SCRIPT_VERSION="v26.04.05"
 
 export TZ=Asia/Shanghai
 
@@ -108,6 +108,10 @@ readonly DEFAULT_MAC_PROXY_MODE="blacklist"
 # block quic
 readonly DEFAULT_BLOCK_QUIC=0
 
+# Whether to include timestamp in logs (0=disable, 1=enable)
+# Disabling this can improve performance by avoiding a process fork for each log entry.
+readonly DEFAULT_LOG_TIMESTAMP=1
+
 # Dry-run mode (disabled by default)
 readonly DEFAULT_DRY_RUN=0
 
@@ -145,13 +149,15 @@ log() {
 
     [ "$should_print" -eq 0 ] && return 0
 
-    local timestamp
-    timestamp="$(date +"%Y-%m-%d %H:%M:%S")"
+    local timestamp=""
+    if [ "$LOG_TIMESTAMP" -eq 1 ]; then
+        timestamp="$(date +"%Y-%m-%d %H:%M:%S") "
+    fi
 
     if [ -t 2 ]; then
-        printf "%b\n" "${color_code}${timestamp} [${level}]: ${message}\033[0m" >&2
+        printf "%b\n" "${color_code}${timestamp}[${level}]: ${message}\033[0m" >&2
     else
-        printf "%s\n" "${timestamp} [${level}]: ${message}" >&2
+        printf "%s\n" "${timestamp}[${level}]: ${message}" >&2
     fi
 }
 
@@ -216,6 +222,7 @@ load_config() {
     BYPASS_MACS_LIST="${BYPASS_MACS_LIST:-$DEFAULT_BYPASS_MACS_LIST}"
     MAC_PROXY_MODE="${MAC_PROXY_MODE:-$DEFAULT_MAC_PROXY_MODE}"
     BLOCK_QUIC="${BLOCK_QUIC:-$DEFAULT_BLOCK_QUIC}"
+    LOG_TIMESTAMP="${LOG_TIMESTAMP:-$DEFAULT_LOG_TIMESTAMP}"
     SKIP_CHECK_FEATURE="${SKIP_CHECK_FEATURE:-0}"
 
     if [ "$VERBOSE" -eq 1 ]; then
@@ -232,7 +239,7 @@ load_config() {
                     APP_PROXY_ENABLE PROXY_APPS_LIST BYPASS_APPS_LIST APP_PROXY_MODE \
                     BYPASS_CN_IP CN_IP_FILE CN_IPV6_FILE CN_IP_URL CN_IPV6_URL \
                     MAC_FILTER_ENABLE PROXY_MACS_LIST BYPASS_MACS_LIST MAC_PROXY_MODE \
-                    BLOCK_QUIC SKIP_CHECK_FEATURE; do
+                    BLOCK_QUIC LOG_TIMESTAMP SKIP_CHECK_FEATURE; do
             eval "log Debug \"$_var: \$$_var\""
         done
     fi
@@ -513,13 +520,29 @@ check_kernel_feature() {
     return 1
 }
 
+init_feature_flags() {
+    log Info "Detecting kernel features..."
+    check_kernel_feature "NETFILTER_XT_TARGET_TPROXY" && HAS_TPROXY=1
+    check_kernel_feature "NETFILTER_XT_MATCH_CONNTRACK" && HAS_CONNTRACK=1
+    check_kernel_feature "NETFILTER_XT_MATCH_OWNER" && HAS_OWNER=1
+    check_kernel_feature "NETFILTER_XT_MATCH_MARK" && HAS_MARK_MT=1
+    check_kernel_feature "NETFILTER_XT_TARGET_MARK" && HAS_MARK_TG=1
+    check_kernel_feature "NETFILTER_XT_MATCH_SOCKET" && HAS_SOCKET=1
+    check_kernel_feature "NETFILTER_XT_MATCH_ADDRTYPE" && HAS_ADDRTYPE=1
+    check_kernel_feature "NETFILTER_XT_MATCH_MAC" && HAS_MAC=1
+    check_kernel_feature "IP_SET" && HAS_IPSET=1
+    check_kernel_feature "NETFILTER_XT_SET" && HAS_XT_SET=1
+    check_kernel_feature "IP6_NF_NAT" && HAS_NAT6=1
+    check_kernel_feature "IP6_NF_TARGET_REDIRECT" && HAS_REDIRECT6=1
+}
+
 check_tproxy_support() {
     if [ "$DRY_RUN" -eq 1 ]; then
         log Debug "TPROXY support check skipped"
         return 0
     fi
 
-    if check_kernel_feature "NETFILTER_XT_TARGET_TPROXY"; then
+    if [ "$HAS_TPROXY" -eq 1 ]; then
         log Info "Kernel TPROXY support confirmed"
         return 0
     else
@@ -532,15 +555,12 @@ check_tproxy_support() {
 run_ipt_command() {
     local cmd="$1"
     shift
-    local args="$*"
 
-    log Debug "[EXEC] $cmd -w 100 $args"
+    log Debug "[EXEC] $cmd -w 100 $*"
 
-    if [ "$DRY_RUN" -eq 1 ]; then
-        return 0
-    fi
+    [ "$DRY_RUN" -eq 1 ] && return 0
 
-    command "$cmd" -w 100 $args
+    command "$cmd" -w 100 "$@"
 }
 
 iptables() {
@@ -575,66 +595,57 @@ ip6_route() {
     command ip -6 route "$@"
 }
 
-get_package_uid() {
-    local pkg="$1"
-    if [ ! -r /data/system/packages.list ]; then
-        log Error "Cannot read /data/system/packages.list"
-        return 1
-    fi
-
-    local uid
-    uid=$(awk -v pkg="$pkg" '$1 == pkg { if ($2 ~ /^[0-9]+$/) print $2; else if ($(NF-1) ~ /^[0-9]+$/) print $(NF-1); exit }' /data/system/packages.list)
-
-    if [ -z "$uid" ]; then
-        log Error "Package not found or invalid UID format: $pkg"
-        return 1
-    fi
-
-    echo "$uid"
-}
-
 find_packages_uid() {
-    local out=""
-    local token
-    local uid_base
-    local final_uid
-    for token in "$@"; do
-        local user_prefix=0
-        local package="$token"
-        case "$token" in
-            *:*)
-                user_prefix="${token%%:*}"
-                package="${token#*:}"
-                case "$user_prefix" in
-                    '' | *[!0-9]*)
-                        log Warn "Invalid user prefix in token: $token, using 0"
-                        user_prefix=0
-                        ;;
-                esac
-                ;;
-        esac
-        if uid_base=$(get_package_uid "$package" 2> /dev/null); then
-            final_uid=$((user_prefix * 100000 + uid_base))
-            out="${out:+$out }$final_uid"
-            log Info "Resolved package $token to UID $final_uid"
-        else
-            log Warn "Failed to resolve UID for package: $package"
-        fi
-    done
-    echo "$out"
-}
+    [ $# -eq 0 ] && return 0
 
-safe_chain_exists() {
-    local family="$1"
-    local table="$2"
-    local chain="$3"
-    local cmd="iptables"
-
-    if [ "$family" = "6" ]; then
-        cmd="ip6tables"
-    fi
-
-    $cmd -t "$table" -L "$chain" > /dev/null 2>&1
+    awk -v tokens="$*" '
+    BEGIN {
+        n = split(tokens, t_arr, " ")
+        for (i = 1; i <= n; i++) {
+            t = t_arr[i]
+            if (t ~ /:/) {
+                split(t, parts, ":")
+                pfx = parts[1]; pkg = parts[2]
+            } else {
+                pfx = 0; pkg = t
+            }
+            # Record that we want this package and store its prefix(es)
+            wanted[pkg] = 1
+            # Multiple prefixes might exist for the same package
+            pfxs[pkg] = (pkg in pfxs) ? pfxs[pkg] " " pfx : pfx
+        }
+    }
+    ($1 in wanted) {
+        base_uid = ""
+        if ($2 ~ /^[0-9]+$/) base_uid = $2
+        else if ($(NF-1) ~ /^[0-9]+$/) base_uid = $(NF-1)
+        
+        if (base_uid != "") {
+            m = split(pfxs[$1], p_arr, " ")
+            for (j = 1; j <= m; j++) {
+                # Store result keyed by package and prefix to preserve order later
+                res[$1, p_arr[j]] = (p_arr[j] * 100000 + base_uid)
+            }
+        }
+    }
+    END {
+        final_out = ""
+        for (i = 1; i <= n; i++) {
+            t = t_arr[i]
+            if (t ~ /:/) {
+                split(t, parts, ":")
+                pfx = parts[1]; pkg = parts[2]
+            } else {
+                pfx = 0; pkg = t
+            }
+            
+            if ((pkg, pfx) in res) {
+                final_out = (final_out == "") ? res[pkg, pfx] : final_out " " res[pkg, pfx]
+            }
+        }
+        print final_out
+    }
+    ' /data/system/packages.list
 }
 
 safe_chain_create() {
@@ -643,13 +654,9 @@ safe_chain_create() {
     local chain="$3"
     local cmd="iptables"
 
-    if [ "$family" = "6" ]; then
-        cmd="ip6tables"
-    fi
+    [ "$family" = "6" ] && cmd="ip6tables"
 
-    if [ "$DRY_RUN" -eq 1 ] || ! safe_chain_exists "$family" "$table" "$chain"; then
-        $cmd -t "$table" -N "$chain"
-    fi
+    $cmd -t "$table" -N "$chain" 2>/dev/null || true
     $cmd -t "$table" -F "$chain"
 }
 
@@ -897,30 +904,30 @@ setup_proxy_chain() {
         safe_chain_create "$family" "$table" "$c"
     done
 
-    if [ "$PERFORMANCE_MODE" -eq 1 ] && check_kernel_feature "NETFILTER_XT_TARGET_MARK" && check_kernel_feature "NETFILTER_XT_MATCH_SOCKET"; then
+    if [ "$PERFORMANCE_MODE" -eq 1 ] && [ "$HAS_MARK_TG" -eq 1 ] && [ "$HAS_SOCKET" -eq 1 ]; then
         $cmd -t "$table" -A DIVERT$suffix -j MARK --set-mark "$mark"
         $cmd -t "$table" -A DIVERT$suffix -j ACCEPT
 
         $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -p tcp -m socket --transparent -j DIVERT$suffix
     fi
 
-    if check_kernel_feature "NETFILTER_XT_MATCH_CONNTRACK"; then
+    if [ "$HAS_CONNTRACK" -eq 1 ]; then
         $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -m conntrack --ctdir REPLY -j ACCEPT
         $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -m conntrack --ctdir REPLY -j ACCEPT
         log Info "Added reply connection direction bypass"
     fi
 
     local bypass_success=0
-    if [ "$FORCE_MARK_BYPASS" -eq 1 ] && check_kernel_feature "NETFILTER_XT_MATCH_MARK" && [ -n "$ROUTING_MARK" ]; then
+    if [ "$FORCE_MARK_BYPASS" -eq 1 ] && [ "$HAS_MARK_MT" -eq 1 ] && [ -n "$ROUTING_MARK" ]; then
         $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -m mark --mark "$ROUTING_MARK" -j ACCEPT
         $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -m mark --mark "$ROUTING_MARK" -j ACCEPT
         log Info "Added bypass for marked traffic with core mark $ROUTING_MARK (forced)"
         bypass_success=1
-    elif check_kernel_feature "NETFILTER_XT_MATCH_OWNER"; then
+    elif [ "$HAS_OWNER" -eq 1 ]; then
         $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT
         log Info "Added bypass for core user $CORE_USER:$CORE_GROUP"
         bypass_success=1
-    elif check_kernel_feature "NETFILTER_XT_MATCH_MARK" && [ -n "$ROUTING_MARK" ]; then
+    elif [ "$HAS_MARK_MT" -eq 1 ] && [ -n "$ROUTING_MARK" ]; then
         $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -m mark --mark "$ROUTING_MARK" -j ACCEPT
         log Info "Added bypass for marked traffic with core mark $ROUTING_MARK"
         bypass_success=1
@@ -931,7 +938,7 @@ setup_proxy_chain() {
 
     # Pre-check performance mode with conntrack
     local _perf_ct=0
-    if [ "$PERFORMANCE_MODE" -eq 1 ] && check_kernel_feature "NETFILTER_XT_MATCH_CONNTRACK"; then
+    if [ "$PERFORMANCE_MODE" -eq 1 ] && [ "$HAS_CONNTRACK" -eq 1 ]; then
         _perf_ct=1
     fi
 
@@ -959,7 +966,7 @@ setup_proxy_chain() {
         fi
     fi
 
-    if check_kernel_feature "NETFILTER_XT_MATCH_ADDRTYPE"; then
+    if [ "$HAS_ADDRTYPE" -eq 1 ]; then
         $cmd -t "$table" -A "BYPASS_IP$suffix" -m addrtype --dst-type LOCAL -p udp ! --dport 53 -j ACCEPT
         $cmd -t "$table" -A "BYPASS_IP$suffix" -m addrtype --dst-type LOCAL ! -p udp -j ACCEPT
         log Info "Added local address type bypass"
@@ -1077,7 +1084,7 @@ setup_proxy_chain() {
 
     local mac
     if [ "$MAC_FILTER_ENABLE" -eq 1 ] && [ "$PROXY_HOTSPOT" -eq 1 ] && [ -n "$HOTSPOT_INTERFACE" ]; then
-        if check_kernel_feature "NETFILTER_XT_MATCH_MAC"; then
+        if [ "$HAS_MAC" -eq 1 ]; then
             log Info "Setting up MAC address filter rules for interface $HOTSPOT_INTERFACE"
             case "$MAC_PROXY_MODE" in
                 blacklist)
@@ -1115,7 +1122,7 @@ setup_proxy_chain() {
     local uids
     local uid
     if [ "$APP_PROXY_ENABLE" -eq 1 ]; then
-        if check_kernel_feature "NETFILTER_XT_MATCH_OWNER"; then
+        if [ "$HAS_OWNER" -eq 1 ]; then
             log Info "Setting up application filter rules in $APP_PROXY_MODE mode"
             case "$APP_PROXY_MODE" in
                 blacklist)
@@ -1246,7 +1253,7 @@ setup_dns_hijack() {
         redirect2)
             # Handle DNS using REDIRECT method
             if [ "$family" = "6" ] && {
-                ! check_kernel_feature "IP6_NF_NAT" || ! check_kernel_feature "IP6_NF_TARGET_REDIRECT"
+                [ "$HAS_NAT6" -eq 0 ] || [ "$HAS_REDIRECT6" -eq 0 ]
             }; then
                 log Warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, IPv6 DNS hijack skipped"
                 return 0
@@ -1288,7 +1295,7 @@ setup_tproxy_chain6() {
 }
 
 setup_redirect_chain6() {
-    if ! check_kernel_feature "IP6_NF_NAT" || ! check_kernel_feature "IP6_NF_TARGET_REDIRECT"; then
+    if [ "$HAS_NAT6" -eq 0 ] || [ "$HAS_REDIRECT6" -eq 0 ]; then
         log Warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, IPv6 proxy setup skipped"
         return 0
     fi
@@ -1410,7 +1417,7 @@ cleanup_redirect_chain4() {
 }
 
 cleanup_redirect_chain6() {
-    if ! check_kernel_feature "IP6_NF_NAT" || ! check_kernel_feature "IP6_NF_TARGET_REDIRECT"; then
+    if [ "$HAS_NAT6" -eq 0 ] || [ "$HAS_REDIRECT6" -eq 0 ]; then
         log Warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, IPv6 cleanup skipped"
         return 0
     fi
@@ -1485,7 +1492,7 @@ detect_proxy_mode() {
 start_proxy() {
     log Info "Starting proxy setup..."
     if [ "$BYPASS_CN_IP" -eq 1 ]; then
-        if ! check_kernel_feature "IP_SET" || ! check_kernel_feature "NETFILTER_XT_SET"; then
+        if [ "$HAS_IPSET" -eq 0 ] || [ "$HAS_XT_SET" -eq 0 ]; then
             log Error "Kernel does not support ipset (CONFIG_IP_SET, CONFIG_NETFILTER_XT_SET). Cannot bypass CN IPs"
             BYPASS_CN_IP=0
         else
@@ -1705,7 +1712,7 @@ manage_ipv6() {
 }
 
 is_func() {
-    type "$1" 2> /dev/null | grep -q 'function'
+    command -v "$1" > /dev/null 2>&1
 }
 
 call_func() {
@@ -1880,6 +1887,7 @@ main() {
 
     init_tmpdir
     init_kernel_config_cache
+    init_feature_flags
 
     detect_proxy_mode
 
@@ -1914,6 +1922,18 @@ DRY_RUN=0
 VERBOSE=0
 CONFIG_DIR=""
 USE_TPROXY=0
+HAS_TPROXY=0
+HAS_CONNTRACK=0
+HAS_OWNER=0
+HAS_MARK_MT=0
+HAS_MARK_TG=0
+HAS_SOCKET=0
+HAS_ADDRTYPE=0
+HAS_MAC=0
+HAS_IPSET=0
+HAS_XT_SET=0
+HAS_NAT6=0
+HAS_REDIRECT6=0
 
 parse_args "$@"
 
