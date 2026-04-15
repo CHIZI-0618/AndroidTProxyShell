@@ -488,18 +488,29 @@ check_kernel_feature() {
     local feature="$1"
     local config_name="CONFIG_${feature}"
 
+    # Check compile-time config (/proc/config.gz)
     if [ -f "$TMPDIR/kernel_config.cache" ]; then
         if grep -qE "^${config_name}=[ym]$" "$TMPDIR/kernel_config.cache" 2> /dev/null; then
-            log Debug "Kernel feature $feature is enabled"
+            log Debug "Kernel feature $feature is enabled (config)"
             return 0
-        else
-            log Warn "Kernel feature $feature is disabled or not found"
-            return 1
         fi
-    else
-        log Warn "Kernel config cache not available, cannot check $feature"
-        return 1
     fi
+
+    # check runtime loaded modules (/sys/module/)
+    local module_name=""
+    case "$feature" in
+        IP_SET)                       module_name="ip_set" ;;
+        NETFILTER_XT_SET)             module_name="xt_set" ;;
+        NETFILTER_XT_MATCH_ADDRTYPE)  module_name="xt_addrtype" ;;
+        NETFILTER_XT_TARGET_TPROXY)   module_name="xt_TPROXY" ;;
+    esac
+    if [ -n "$module_name" ] && [ -d "/sys/module/$module_name" ]; then
+        log Debug "Kernel feature $feature is enabled (loaded module)"
+        return 0
+    fi
+
+    log Warn "Kernel feature $feature is disabled or not found"
+    return 1
 }
 
 check_tproxy_support() {
